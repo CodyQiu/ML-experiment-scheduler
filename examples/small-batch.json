@@ -1,0 +1,13 @@
+{
+  "name": "small-lr-width-sweep",
+  "task": "synthetic-mlp-v1",
+  "maxAttempts": 3,
+  "jobs": [
+    {"seed": 0, "config": {"learningRate": 0.001, "hiddenUnits": 16, "hiddenLayers": 1, "batchSize": 64, "epochs": 20, "optimizer": "adam", "weightDecay": 0.0}},
+    {"seed": 0, "config": {"learningRate": 0.01,  "hiddenUnits": 16, "hiddenLayers": 1, "batchSize": 64, "epochs": 20, "optimizer": "adam", "weightDecay": 0.0}},
+    {"seed": 0, "config": {"learningRate": 0.1,   "hiddenUnits": 16, "hiddenLayers": 1, "batchSize": 64, "epochs": 20, "optimizer": "sgd",  "weightDecay": 0.0}},
+    {"seed": 0, "config": {"learningRate": 0.001, "hiddenUnits": 64, "hiddenLayers": 2, "batchSize": 64, "epochs": 20, "optimizer": "adam", "weightDecay": 0.0001}},
+    {"seed": 0, "config": {"learningRate": 0.01,  "hiddenUnits": 64, "hiddenLayers": 2, "batchSize": 64, "epochs": 20, "optimizer": "adam", "weightDecay": 0.0001}},
+    {"seed": 0, "config": {"learningRate": 0.1,   "hiddenUnits": 64, "hiddenLayers": 2, "batchSize": 64, "epochs": 20, "optimizer": "sgd",  "weightDecay": 0.0001}}
+  ]
+}

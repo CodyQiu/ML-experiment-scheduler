@@ -1,0 +1,15 @@
+# Java / Maven
+api/target/
+api/.mvn/wrapper/maven-wrapper.jar
+
+# Python (worker)
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Editors and OS
+.idea/
+*.iml
+.vscode/
+.DS_Store

@@ -1,0 +1,9 @@
+{
+  "name": "",
+  "task": "synthetic-mlp-v1",
+  "maxAttempts": 0,
+  "jobs": [
+    {"seed": 0, "config": {"learningRate": 0.01, "hiddenUnits": 16, "hiddenLayers": 1, "batchSize": 64, "epochs": 20, "optimizer": "adam", "weightDecay": 0.0}},
+    {"seed": 1, "config": {"learningRate": 5.0,  "hiddenUnits": 16, "hiddenLayers": 1, "batchSize": 64, "epochs": 0,  "optimizer": "adam", "weightDecay": 0.0}}
+  ]
+}

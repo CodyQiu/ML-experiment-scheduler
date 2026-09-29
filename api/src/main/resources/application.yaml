@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: scheduler-api
+  datasource:
+    # Defaults reach the PostgreSQL that compose.yaml publishes on localhost, for running the
+    # API from an IDE. The api container overrides these with SPRING_DATASOURCE_* variables.
+    url: jdbc:postgresql://localhost:5432/scheduler
+    username: scheduler
+    password: scheduler
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
