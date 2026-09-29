@@ -4,6 +4,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,6 +43,13 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(NotFoundException.class)
 	ProblemDetail handleNotFound(NotFoundException ex) {
 		return problem(HttpStatus.NOT_FOUND, "NOT_FOUND", ex.getMessage());
+	}
+
+	@ExceptionHandler(ConflictException.class)
+	ProblemDetail handleConflict(ConflictException ex) {
+		ProblemDetail problem = problem(HttpStatus.CONFLICT, ex.code(), ex.getMessage());
+		ex.properties().forEach(problem::setProperty);
+		return problem;
 	}
 
 	@ExceptionHandler(Exception.class)
@@ -124,6 +132,9 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 		}
 		if (target == String.class) {
 			return "must be a string";
+		}
+		if (target == UUID.class) {
+			return "must be a UUID";
 		}
 		if (Collection.class.isAssignableFrom(target)) {
 			return "must be an array";

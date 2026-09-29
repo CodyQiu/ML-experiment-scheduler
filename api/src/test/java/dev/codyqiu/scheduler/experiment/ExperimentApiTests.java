@@ -80,15 +80,16 @@ class ExperimentApiTests extends IntegrationTest {
 		jdbc.sql("""
 				UPDATE jobs
 				SET state = 'RUNNING', attempt_count = 1, current_attempt_id = gen_random_uuid(),
-				    worker_id = 'worker-a', started_at = now()
+				    worker_id = 'worker-a', started_at = now(), lease_expires_at = now() + interval '30 seconds'
 				WHERE job_index IN (1, 2, 3)
 				""").update();
 		jdbc.sql("""
 				UPDATE jobs
-				SET state = 'SUCCEEDED', val_accuracy = 0.9, result = '{"valAccuracy": 0.9}', finished_at = now()
+				SET state = 'SUCCEEDED', val_accuracy = 0.9, result = '{"valAccuracy": 0.9}', finished_at = now(),
+				    lease_expires_at = NULL
 				WHERE job_index = 2
 				""").update();
-		jdbc.sql("UPDATE jobs SET state = 'FAILED', finished_at = now() WHERE job_index = 3").update();
+		jdbc.sql("UPDATE jobs SET state = 'FAILED', finished_at = now(), lease_expires_at = NULL WHERE job_index = 3").update();
 
 		assertProgress(body(get("/experiments/1")), 5, 2, 1, 1, 1);
 	}

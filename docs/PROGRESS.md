@@ -1,62 +1,118 @@
 # Progress
 
-_Last updated: 2026-09-28_
+_Last updated: 2026-09-29_
 
 ## Status
 
 | Increment | Scope | Status |
 |---|---|---|
-| 1.1 | Repo skeleton, V1 schema, submission + retrieval API, error format, Compose (postgres + api), integration tests | done |
-| 1.2 | Worker protocol in the API: atomic claim, fenced completion, concurrency tests | next |
-| 1.3 | Python worker with real PyTorch training, Compose worker service, end-to-end run | after 1.2 |
-| M2 | Leases, heartbeats, recovery sweeper, failure reporting, bounded retries, attempt history, idempotent submission, safe repeated completion, race tests, kill-a-worker demo | planned |
+| 1.1–1.3 | MVP: submission API, atomic claims, fenced completion, Python worker, Compose | done |
+| 2.1 | Leases, heartbeats, recovery sweep, strict fencing, attempt history (V2) | done |
+| 2.2 | Failure reports (retryable or not), bounded retries on reported failures, attempt history in the API | next |
+| 2.3 | Idempotent submission, safe repeated completion, best-configurations endpoint | planned |
+| 2.4 | Scripted kill-a-worker and stale-worker demos | planned |
 | M3 | CI, structured logs, architecture README, recovery demo write-up, benchmarks | planned |
 
-## Completed in 1.1
+## Completed
 
-- `api/`: Spring Boot 4.1.1 on Java 21 with the Maven Wrapper (Maven 3.9.16). Explicit SQL through
-  `JdbcClient` and `JdbcTemplate`.
-- `V1__create_experiments_and_jobs.sql`: `experiments` and `jobs`, with the claim-identity columns
-  the MVP needs, CHECK constraints for the lifecycle invariants, and a partial index for claims.
-- `POST /experiments` (validated, one transaction), `GET /experiments/{id}` (progress counts from one
-  statement), `GET /experiments/{id}/jobs`, and `GET /jobs/{id}`.
-- RFC 9457 problem details with a stable `code` and per-field `errors`. Strict JSON parsing: unknown
-  fields, type coercion, fractional integers, and duplicate keys are all rejected.
-- `compose.yaml`: PostgreSQL 18.6 and the API, with health checks and a persistent volume.
-- `scripts/mvnw-docker.sh`: runs Maven, including the Testcontainers tests, without a local JDK.
-- `examples/small-batch.json` (6 jobs) and `examples/invalid-batch.json`.
+**1.1–1.3 (milestone 1)**
 
-## Verified (2026-09-28: macOS arm64, Docker Desktop 29.2.0, VM with 12 CPUs / 8 GB)
+- Spring Boot 4.1.1 API on Java 21, PostgreSQL 18, and Flyway V1.
+- Strict validated submission, and a single-statement `SKIP LOCKED` claim.
+- A guarded completion, decided by the affected-row count.
+- A Python 3.14 worker (torch 2.14 CPU): deterministic task `synthetic-mlp-v1`, bounded retries of
+  completions, two-stage shutdown.
+- Compose, with scalable workers.
 
-- `scripts/mvnw-docker.sh verify`: 30 tests, 0 failures, against PostgreSQL 18.6 through Testcontainers.
-- Two mutation checks confirmed the tests catch real breakage:
-  - Disabling `FAIL_ON_UNKNOWN_PROPERTIES` makes the misspelled-field test fail (201 instead of 400).
-  - Removing the submission transaction makes the atomicity test fail (an orphaned experiment row).
-- `docker compose up -d --build --wait` brings both services up healthy. Submission, retrieval,
-  400, and 404 were exercised with curl. Data survives an API restart, and Flyway validates V1
-  instead of re-applying it.
+**2.1**
+
+- **`V2__leases_and_attempts.sql`:**
+  - `jobs.lease_expires_at`, present exactly when the job is `RUNNING`.
+  - An `attempts` table with one-running and one-success partial unique indexes.
+  - A backfill that makes V1's stuck `RUNNING` jobs recoverable.
+- **The claim** sets the lease and inserts the attempt row in one transaction. The assignment
+  carries `leaseSeconds` and `heartbeatIntervalSeconds`.
+- **`POST /worker/jobs/{id}/heartbeat`**, guarded on state, attempt, and `lease_expires_at > now()`.
+- **Completion** gained the same strict lease check, and a `409 LEASE_EXPIRED` distinct from
+  `ATTEMPT_NOT_CURRENT`.
+- **`RecoveryService` plus `RecoverySweeper`:**
+  - Every 5 s, in batches of 100, lock expired leases with `SKIP LOCKED`.
+  - Re-queue a job while attempts remain, otherwise `FAILED`, and mark the attempts `EXPIRED`.
+- **`SchedulerProperties`:** lease 30 s, heartbeat 10 s (at most half the lease, enforced at
+  startup), sweep every 5 s. Overridable with `SCHEDULER_*` environment variables.
+- **Worker:** a heartbeat thread for training and reporting. A `409` or a full lease without a
+  successful renewal stops training at the next minibatch.
+- **`CLAUDE.md`:** commands, architecture rules, testing conventions, and environment gotchas.
+
+## Verified (2026-09-29: macOS arm64, Docker Desktop 29.2.0)
+
+**API: `scripts/mvnw-docker.sh verify` runs 86 tests, 0 failures.** New in 2.1:
+
+- Heartbeat and strict-lease HTTP tests. An expired lease can neither renew nor complete before
+  recovery runs, and a stale attempt cannot touch its successor's lease.
+- Recovery tests:
+  - an expired lease is re-queued, and attempt 2 follows;
+  - live, finished, and queued jobs are untouched;
+  - the final attempt expiring makes the job `FAILED`;
+  - 8 concurrent sweeps recover each of 40 attempts exactly once.
+- `CompletionRecoveryRaceTests` forces both orders of the completion-versus-recovery race with held
+  transactions.
+- `MigrationTests` runs V1 with data, then V2.
+- Mutation checks. Each removed guard fails the tests aimed at it:
+  - the lease check on completion;
+  - the lease check on heartbeat;
+  - the attempt check on heartbeat;
+  - the sweep's row lock (concurrent sweeps collide, and the completion-first race breaks);
+  - the sweep's expiry predicate.
+
+**Worker: `uv run pytest` runs 55 tests, 0 failures.**
+
+- New tests cover the `Heartbeat` thread (renewal, `409`, tolerated transient failures,
+  self-fencing on a fake clock), and training that stops when the lease is lost.
+- Mutations of the `409` handling, of self-fencing, and of the lease check in training are all
+  caught.
+- One weak test was found by mutation and tightened.
+
+**Live Compose stack (fresh database, 2 workers, default settings):**
+
+- V1 and V2 applied. The example batch left 6 jobs `SUCCEEDED` and 6 attempts `SUCCEEDED`.
+- **SIGKILL** of the worker training a 17 s job, before its first heartbeat:
+  - re-queued 30 s after the kill (lease plus sweep),
+  - claimed by the other worker 1 s later as attempt 2, which `SUCCEEDED`;
+  - attempt 1 is `EXPIRED` with `LEASE_EXPIRED`.
+- **`docker pause`** of the worker training a job, for longer than its lease:
+  - re-queued at 31 s, attempt 2 claimed by the other worker at 32 s;
+  - on unpause, the frozen worker's heartbeat got `409 ATTEMPT_NOT_CURRENT`, and it stopped
+    training and reported nothing;
+  - attempt 2's result was accepted.
 
 ## Known limitations (current)
 
-- No worker endpoints yet, so jobs stay `QUEUED`.
-- The MVP limitations listed in [DESIGN.md](DESIGN.md#mvp): no crash recovery, retries, failure
-  reports, idempotent submission, or completion replay.
-- The request body is parsed before the 500-job limit is checked, and body size is not capped
-  separately. That is acceptable for a local single-user service.
-- No CI yet (M3).
-- The dev machine has no local JDK. Java builds run in Docker unless JDK 21 is installed.
+- **Failures can't be reported yet (2.2).** Divergence, an unrunnable assignment, an aborted run,
+  and an undeliverable result all rely on lease expiry. The job is retried until `maxAttempts`,
+  then `FAILED`. That is bounded, but deterministic failures waste attempts, and each costs about
+  35 s.
+- **Attempt history is in the database, not yet in the API.** 2.2 adds it to `GET /jobs/{id}`.
+- **Duplicate submissions create duplicate experiments,** and a retried completion gets `409`
+  rather than a replay (2.3).
+- **Strictness is bounded by statement duration.** A lease is judged at its transaction's start,
+  so a completion can win by the milliseconds its statement takes (see DESIGN.md).
+- **No best-configurations endpoint** (2.3); rank with `jq`.
+- **Other:** no CI, bodies parsed before size limits, no local JDK.
 
-## Next: increment 1.2 (worker protocol, API side)
+## Next: increment 2.2 (failures and bounded retries)
 
-1. `POST /worker/jobs/claim`: the single-statement `FOR UPDATE SKIP LOCKED` claim from DESIGN.md.
-   Returns `200` with an assignment, or `204` when nothing is queued.
-2. `POST /worker/jobs/{id}/complete`: guarded `UPDATE` on `state` and `current_attempt_id`, decided by
-   the affected-row count. `409 ATTEMPT_NOT_CURRENT` otherwise. Metrics are validated (`valAccuracy`
-   in [0, 1], finite losses, and so on).
-3. Tests against real PostgreSQL:
-   - N threads released together by a latch race to claim M jobs. No job is claimed twice, and the
-     number of claims is min(N, M).
-   - Claims follow FIFO order.
-   - An empty queue returns 204.
-   - A completion with the wrong attempt id is rejected and leaves the row unchanged.
-   - A completion on an already succeeded job is rejected and leaves the result unchanged.
+1. `POST /worker/jobs/{id}/fail` with `{attemptId, retryable, errorType, message}`.
+   - It uses the same guards as completion (state, attempt, live lease).
+   - A retryable failure with attempts left goes back to the queue. Otherwise the job is `FAILED`.
+   - The attempt is recorded `FAILED` with its error.
+2. `GET /jobs/{id}` includes `attempts: [...]` (number, worker, status, times, error) and the
+   latest error.
+3. The worker reports divergence (non-retryable), unrunnable assignments (non-retryable), and
+   unexpected exceptions (retryable), instead of waiting for the lease to run out.
+4. Tests:
+   - retries stop at `maxAttempts` through reported failures, and through a mix of failures and
+     expiries;
+   - a non-retryable failure ends the job at once;
+   - a stale attempt cannot fail a newer attempt;
+   - a failure racing recovery.

@@ -5,35 +5,95 @@ a small CPU-only PyTorch model on a deterministic synthetic dataset, and report 
 project is about correctness under concurrency and failure: atomic claims, leases, fencing tokens,
 bounded retries, and idempotent submission, all backed by PostgreSQL.
 
-**Status:** milestone 1 is in progress. Submission and retrieval work, and workers come next. See
-[docs/PROGRESS.md](docs/PROGRESS.md).
+**Status:** milestone 1 (end-to-end MVP) is complete. In milestone 2, leases, heartbeats, and
+crash recovery work (2.1); failure reports, idempotent submission, and replays come next. See
+[docs/PROGRESS.md](docs/PROGRESS.md) and [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Quick start
 
-Requires Docker with Compose v2. A local JDK is optional.
+Requires Docker with Compose v2 and `jq`. A local JDK or Python is optional.
 
 ```bash
-docker compose up -d --build --wait          # PostgreSQL 18 + API on localhost:8080
+docker compose up -d --build --wait     # PostgreSQL 18, the API on localhost:8080, one worker
 
-curl -i -X POST localhost:8080/experiments \
-  -H 'Content-Type: application/json' --data @examples/small-batch.json
-curl -s localhost:8080/experiments/1 | jq
-curl -s localhost:8080/experiments/1/jobs | jq '.jobs[] | {id, jobIndex, state, config}'
+# Submit six configs and keep the new experiment's id
+ID=$(curl -s -X POST localhost:8080/experiments -H 'Content-Type: application/json' \
+       --data @examples/small-batch.json | jq .id)
 
-# Rejected with per-field errors, and nothing is stored:
-curl -s -X POST localhost:8080/experiments \
-  -H 'Content-Type: application/json' --data @examples/invalid-batch.json | jq
+# Watch progress until every job has finished (a few seconds; Ctrl-C to quit)
+while sleep 1; do curl -s localhost:8080/experiments/$ID | jq -c .progress; done
 
-docker compose down        # stop the stack; add -v to also delete the database volume
+# Compare the successful configurations, best first
+curl -s localhost:8080/experiments/$ID/jobs | jq -r '.jobs | map(select(.state == "SUCCEEDED"))
+  | sort_by(-.valAccuracy)[] | "\(.valAccuracy)  \(.config.optimizer) lr=\(.config.learningRate) \(.config.hiddenUnits)x\(.config.hiddenLayers)"'
+
+docker compose logs worker              # claim → train → report, one line each
+```
+
+**More workers and a bigger batch.** This runs the 100-config grid; add `--seeds 2` for 200 jobs.
+
+```bash
+docker compose up -d --scale worker=3 --wait
+python3 scripts/make_sweep.py | curl -s -X POST localhost:8080/experiments \
+  -H 'Content-Type: application/json' --data @- | jq '{id, progress}'
+```
+
+**Crash recovery.** Kill a worker mid-job. After its 30 s lease expires, the sweep re-queues the job
+and another worker runs attempt 2:
+
+```bash
+docker compose up -d --scale worker=2 --wait
+curl -s -X POST localhost:8080/experiments -H 'Content-Type: application/json' -d '{"name":"crash","task":"synthetic-mlp-v1",
+  "jobs":[{"seed":0,"config":{"learningRate":0.01,"hiddenUnits":256,"hiddenLayers":4,"batchSize":8,"epochs":100,"optimizer":"adam","weightDecay":0.0}}]}' | jq .id
+curl -s localhost:8080/experiments/<id>/jobs | jq '.jobs[0] | {id, state, workerId}'   # note the workerId prefix
+docker kill -s KILL <worker container whose ID starts with that prefix>   # see: docker compose ps worker
+docker compose logs -f api | grep -E 'Claimed|expired|Accepted'           # attempt 1 expires, attempt 2 wins
+```
+
+**Stopping.**
+
+```bash
+docker compose stop worker    # each worker finishes and reports its current job, then exits
+docker compose down           # stop everything; add -v to also delete the database volume
+```
+
+A rejected batch gets per-field errors, and nothing is stored:
+
+```bash
+curl -s -X POST localhost:8080/experiments -H 'Content-Type: application/json' \
+  --data @examples/invalid-batch.json | jq
+```
+
+### Act as a worker by hand
+
+Stop the real workers first (`docker compose up -d --scale worker=0`), or they will claim the jobs
+before you do. A claim's lease lasts 30 s. Heartbeat to extend it, or finish within it; after that,
+the job is taken back and your attempt id is rejected.
+
+```bash
+A=$(curl -s -X POST localhost:8080/worker/jobs/claim -H 'Content-Type: application/json' -d '{"workerId":"manual-1"}')
+echo "$A" | jq                                  # 200 with the assignment, or empty on 204 (nothing queued)
+JOB=$(jq -r .jobId <<<"$A"); ATTEMPT=$(jq -r .attemptId <<<"$A")
+METRICS='{"valAccuracy":0.91,"valLoss":0.25,"trainLoss":0.2,"trainingSeconds":1.5}'
+
+curl -s -X POST localhost:8080/worker/jobs/$JOB/heartbeat -H 'Content-Type: application/json' \
+  -d "{\"attemptId\":\"$ATTEMPT\"}" | jq                           # 200: lease extended by 30 s
+curl -s -X POST localhost:8080/worker/jobs/$JOB/complete -H 'Content-Type: application/json' \
+  -d "{\"attemptId\":\"$ATTEMPT\",\"metrics\":$METRICS}" | jq     # 200: accepted and final
+curl -s -X POST localhost:8080/worker/jobs/$JOB/complete -H 'Content-Type: application/json' \
+  -d "{\"attemptId\":\"$ATTEMPT\",\"metrics\":$METRICS}" | jq     # 409 ATTEMPT_NOT_CURRENT: already SUCCEEDED
 ```
 
 ## Tests
 
-The integration tests run against real PostgreSQL through Testcontainers, so Docker must be running.
+The API's integration tests run against real PostgreSQL through Testcontainers, so Docker must be
+running.
 
 ```bash
 cd api && ./mvnw verify          # with a local JDK 21
 scripts/mvnw-docker.sh verify    # without one: runs the Maven Wrapper in a JDK 21 container
+
+cd worker && uv run pytest       # worker tests; uv installs the locked environment into worker/.venv
 ```
 
 ## Layout
@@ -41,8 +101,10 @@ scripts/mvnw-docker.sh verify    # without one: runs the Maven Wrapper in a JDK 
 ```
 api/            Spring Boot service: REST API, scheduling rules, all database access
   src/main/resources/db/migration/   Flyway SQL migrations
+worker/         Python worker: claim → train (PyTorch, CPU) → report
+  scheduler_worker/   task.py (dataset, model, metrics), client.py (HTTP), worker.py (loop)
 compose.yaml    Local stack
-docs/           DESIGN.md (schema, lifecycle, API contract, guarantees), PROGRESS.md
+docs/           DESIGN.md (schema, lifecycle, API contract, guarantees, worker), PROGRESS.md
 examples/       Sample request bodies
-scripts/        Developer helpers
+scripts/        make_sweep.py (grid sweeps), mvnw-docker.sh
 ```
