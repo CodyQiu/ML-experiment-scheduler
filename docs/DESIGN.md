@@ -566,7 +566,14 @@ RETURNING state, attempt_count, max_attempts
   `retryable`.
 
 **Leases.** These are the defaults. They are set in `SchedulerProperties` and overridable with
-environment variables such as `SCHEDULER_LEASE_DURATION`.
+environment variables. Spring maps a variable to a property by replacing `_` with `.` and ignoring
+dashes, so `SCHEDULER_LEASE_HEARTBEATINTERVAL=3s` sets `scheduler.lease.heartbeat-interval`.
+
+- `RecoverySweeper` schedules itself from the same bound properties (a `SchedulingConfigurer`),
+  rather than a `@Scheduled` placeholder that would resolve environment variables by other rules.
+- One binding path governs the whole policy.
+- At startup the API logs the effective policy, e.g. `Recovering expired leases every 1.0 s …
+  (leases last 10.0 s, heartbeats every 3.0 s)`. The demo checks that line.
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -605,6 +612,14 @@ exception rolls back all four writes.
 - **Why a periodic sweep, not recovery during claims.** A job whose final attempt expired must
   become `FAILED` promptly even if nobody claims anything. The sweep keeps progress counts honest.
   It is the only recovery mechanism.
+- **Three independent defenses stop a stale overwrite.** The completion guard checks the attempt,
+  state, and lease. Beyond it, the `attempts` row-count check refuses to mark a non-`RUNNING`
+  attempt `SUCCEEDED`.
+  - Shown by running the demo against an API whose completion guard had no attempt check. The
+    stale report *passed* the broken guard, then hit `IllegalStateException: Expected 1 running
+    attempt row(s) … but updated 0`.
+  - The transaction rolled back, so the job kept attempt 2's result. The demo still failed that
+    run, because a `500` is not the correct answer.
 - **Every API instance may sweep.** Mutation-tested: removing the lock clause makes concurrent
   sweeps collide.
 
@@ -752,7 +767,8 @@ Training runs on one CPU thread with `torch.use_deterministic_algorithms(True)`.
     the server may have renewed later than the send.
   - The self-fencing check only saves wasted training. The server would reject the result anyway.
     It uses elapsed time on one machine and never compares clocks.
-- **Verified live with `docker pause`.**
+- **Verified live with `docker pause`,** and scripted, with checks, as the `stale` scenario of
+  `scripts/demo.sh`:
   1. A worker was frozen mid-training for longer than its lease.
   2. Recovery re-queued the job, and the other worker claimed attempt 2.
   3. On unpause, the frozen worker's next heartbeat got `409 ATTEMPT_NOT_CURRENT`. It stopped
@@ -832,6 +848,8 @@ forbids.
 | Heartbeats continue through reporting | A slow, retried report would otherwise let the lease lapse after training succeeded |
 | The worker self-fences after a full lease without a successful renewal | Saves compute during outages. It is measured from the last success's receipt, on the local monotonic clock |
 | Tests turn off the periodic sweep (`scheduler.recovery.enabled=false`) | A background sweep would race tests that expire a lease on purpose. The tests call `RecoveryService` directly |
+| `scripts/demo.sh` runs in its own Compose project with 10 s leases, and asserts every claim | The demo is evidence, not a slideshow. It never touches the user's stack, finishes in about 100 s, and exits non-zero on any violation. Its checks were shown to fail against a broken guard |
+| The demo's stale report is sent while the replacement attempt is still running | That is when a missing attempt check would overwrite work. After success, the state and lease guards block the report anyway |
 | A failure report is one guarded `UPDATE` with `CASE`, not a read followed by a write | The budget and authority are checked under the lock that performs the write |
 | `retryable` comes from the worker; the budget comes from the server | Only the worker knows whether an error is deterministic. Only the server can enforce the limit across workers |
 | Every started execution counts against `maxAttempts`, including shutdowns | A simple, uniform rule, and attempt numbers are never reused |

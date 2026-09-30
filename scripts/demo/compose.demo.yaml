@@ -1,0 +1,14 @@
+# Overrides for scripts/demo.sh only. Short leases make recovery happen within seconds, and workers
+# that poll at least once a second make hand-overs quick. Not for normal use.
+#
+# Spring maps environment variables to properties by replacing "_" with "." and ignoring dashes:
+# SCHEDULER_LEASE_HEARTBEATINTERVAL sets scheduler.lease.heartbeat-interval.
+services:
+  api:
+    environment:
+      SCHEDULER_LEASE_DURATION: 10s
+      SCHEDULER_LEASE_HEARTBEATINTERVAL: 3s
+      SCHEDULER_RECOVERY_SWEEPINTERVAL: 1s
+  worker:
+    environment:
+      POLL_MAX_SECONDS: "1"

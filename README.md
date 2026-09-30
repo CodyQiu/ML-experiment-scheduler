@@ -5,9 +5,29 @@ a small CPU-only PyTorch model on a deterministic synthetic dataset, and report 
 project is about correctness under concurrency and failure: atomic claims, leases, fencing tokens,
 bounded retries, and idempotent submission, all backed by PostgreSQL.
 
-**Status:** milestone 1 (end-to-end MVP) is complete. Milestone 2's reliability features work:
-leases, heartbeats, crash recovery (2.1), failure reports, bounded retries (2.2), idempotent
-submission, and safe repeated completion (2.3). Scripted failure demos come next. See
+**Status:** milestones 1 (end-to-end MVP) and 2 (reliability) are complete. That covers atomic
+claims, leases and heartbeats, crash recovery, failure reports with bounded retries, idempotent
+submission, safe repeated completion, and a checked end-to-end demo. Milestone 3 (CI, structured
+logs, benchmarks) is next.
+
+## See it handle failure
+
+```bash
+scripts/demo.sh    # about 100 s; needs Docker, jq, curl, python3
+```
+
+It runs in its own Compose project, with API on `:18080` and 10 s leases, so it never touches the
+stack below. It walks through:
+
+1. a 200-configuration sweep shared by 3 workers, then the best configurations;
+2. a worker SIGKILLed mid-training, whose job another worker finishes after the lease expires;
+3. a worker frozen past its lease, whose old attempt then tries to report: rejected while its
+   replacement runs, rejected again after it succeeds, and the worker itself is fenced when it
+   wakes.
+
+Every claim is checked (`[ok]`/`[FAIL]`), and the exit status is non-zero on any violation.
+`scripts/demo.sh crash stale` runs only some scenarios, and `KEEP=1` leaves the stack up to
+explore. See
 [docs/PROGRESS.md](docs/PROGRESS.md) and [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Quick start
@@ -112,5 +132,5 @@ worker/         Python worker: claim → train (PyTorch, CPU) → report
 compose.yaml    Local stack
 docs/           DESIGN.md (schema, lifecycle, API contract, guarantees, worker), PROGRESS.md
 examples/       Sample request bodies
-scripts/        make_sweep.py (grid sweeps), mvnw-docker.sh
+scripts/        demo.sh (checked end-to-end demo), make_sweep.py (grid sweeps), mvnw-docker.sh
 ```

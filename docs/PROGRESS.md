@@ -1,6 +1,6 @@
 # Progress
 
-_Last updated: 2026-09-29_
+_Last updated: 2026-09-29_ (milestone 2 complete)
 
 ## Status
 
@@ -10,8 +10,8 @@ _Last updated: 2026-09-29_
 | 2.1 | Leases, heartbeats, recovery sweep, strict fencing, attempt history (V2) | done |
 | 2.2 | Failure reports (retryable or not), bounded retries on reported failures, attempt history in the API | done |
 | 2.3 | Idempotent submission, safe repeated completion, best-configurations endpoint | done |
-| 2.4 | Scripted kill-a-worker and stale-worker demos | next |
-| M3 | CI, structured logs, architecture README, recovery demo write-up, benchmarks | planned |
+| 2.4 | Scripted end-to-end demo with checks (`scripts/demo.sh`) | done |
+| M3 | CI, structured logs, architecture README, benchmarks | next |
 
 ## Completed
 
@@ -44,8 +44,7 @@ _Last updated: 2026-09-29_
   successful renewal stops training at the next minibatch.
 - **`CLAUDE.md`:** commands, architecture rules, testing conventions, and environment gotchas.
 
-Committed as `84cf4a3` on branch `milestone-2`, covering 1.2 through 2.1. Increment 2.2 is
-`d0d7daf`.
+Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3 as `eefcd0e`.
 
 **2.2**
 
@@ -79,7 +78,37 @@ Committed as `84cf4a3` on branch `milestone-2`, covering 1.2 through 2.1. Increm
 - **`GET /experiments/{id}/best?limit=N`:** successful jobs by `valAccuracy`, ties broken by
   `jobIndex`. Parameter errors are reported as field errors.
 
+**2.4**
+
+- **`scripts/demo.sh`** covers the whole story in about 100 s, in an isolated Compose project
+  (`mlsched-demo`, API on `:18080`) with 10 s leases:
+  1. **`sweep`:** a 200-configuration sweep across 3 workers, an idempotent resubmission, and the
+     ranking;
+  2. **`crash`:** SIGKILL a worker mid-training, then recovery and attempt 2;
+  3. **`stale`:** `docker pause` a worker past its lease. Its old attempt reports while the
+     replacement runs and again after it succeeds; the worker is woken and fenced.
+- 17 `[ok]`/`[FAIL]` checks (1 at startup, then 5 / 4 / 7 per scenario); the exit status is
+  non-zero on any violation. `KEEP=1` leaves the stack up, and scenarios can be picked by name.
+- **`RecoverySweeper`** now schedules itself from `SchedulerProperties`, so all lease policy has
+  one binding path. It logs the effective policy at startup.
+
 ## Verified (2026-09-29: macOS arm64, Docker Desktop 29.2.0)
+
+**2.4, the demo itself (verified against real containers):**
+
+- **Full run:** every check passed.
+  - Sweep: 200/200 in about 18 s, split 66 / 69 / 65, with a peak of 3 running.
+  - Crash: SIGKILL at 42 s, `QUEUED` at 50 s, attempt 2 at 51 s, `SUCCEEDED` at 67 s.
+  - Stale: attempt 2 at 81 s. The stale report got `409` while attempt 2 was running, and the
+    woken worker was fenced in under a second. The late report got `409`, and the result was
+    unchanged.
+- **Negative check:** against an API with the completion guard's attempt check removed, the demo
+  exited `1`.
+  - The stale report got `500`, from `IllegalStateException: Expected 1 running attempt row(s) …
+    but updated 0`.
+  - The attempts row check rolled the write back, so the job kept attempt 2's result (0.992).
+- **After restoring:** `scripts/demo.sh crash stale` exited `0`, with 12 of 12 checks passing and
+  no containers left behind.
 
 **2.3, API: `scripts/mvnw-docker.sh verify` runs 142 tests, 0 failures.**
 
@@ -201,16 +230,19 @@ Committed as `84cf4a3` on branch `milestone-2`, covering 1.2 through 2.1. Increm
   so a completion can win by the milliseconds its statement takes (see DESIGN.md).
 - **Other:** no CI, bodies parsed before size limits, no local JDK.
 
-## Next: increment 2.4 (scripted failure demonstrations)
+## Next: milestone 3 (evidence and polish)
 
-1. **`scripts/demo-crash-recovery.sh`:**
-   - start 2 workers and submit long jobs;
-   - SIGKILL the worker training one of them, and print the timeline: `RUNNING` → lease expiry →
-     `QUEUED` → attempt 2 → `SUCCEEDED`;
-   - finish with the attempt history.
-2. **`scripts/demo-stale-worker.sh`:** `docker pause` a worker past its lease, let another worker
-   take over, unpause, and show the old attempt's heartbeat rejected and its result never
-   accepted.
-3. **Both scripts** take short lease settings (`SCHEDULER_LEASE_DURATION=10s`) so a demo runs in
-   well under a minute, check the outcome instead of only printing it, and exit non-zero if a
-   guarantee is violated.
+1. **3.1 CI (GitHub Actions):**
+   - `./mvnw verify`, with Testcontainers on the runner's Docker;
+   - `uv run pytest`;
+   - building both images;
+   - optionally, `scripts/demo.sh` as a nightly end-to-end job.
+2. **3.2 Structured logs:** JSON logs from the API (Spring Boot's structured logging) and the
+   worker, carrying `experimentId`, `jobId`, `attemptNumber`/`attemptId`, and `workerId` as fields.
+3. **3.3 Benchmark:**
+   - `scripts/benchmark.sh` measures API latency (claim, complete, submit) separately from training
+     throughput at 1, 2, and 4 workers;
+   - it records the hardware, CPU limits, batch, and warm-up;
+   - a results template holds observed numbers only.
+4. **3.4 Architecture README:** the one-page architecture, how to run the demo, and what each
+   guarantee rests on.
