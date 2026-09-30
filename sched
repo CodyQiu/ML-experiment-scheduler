@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""sched: run the ML experiment scheduler and its experiments with short commands.
+
+  ./sched start            start PostgreSQL, the API, and 2 workers
+  ./sched sweep            submit a 100-configuration grid sweep
+  ./sched watch            follow the latest experiment until it finishes
+  ./sched best             the best configurations so far
+  ./sched stop             stop everything (your data is kept)
+
+Run ./sched help for every command. Needs Docker, and Python 3.9 or later.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+API = os.environ.get("SCHED_API", "http://localhost:8080").rstrip("/")
+MAX_JOBS = 500  # per experiment, as the API enforces
+
+
+class Failure(Exception):
+    """An error to show the user, without a traceback."""
+
+
+# --- Talking to the API ---------------------------------------------------------------------------
+
+def call(method: str, path: str, body: object = None, headers: dict | None = None) -> dict:
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(API + path, data=data, method=method, headers={
+        "Content-Type": "application/json", "Accept": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read()
+            return json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as error:
+        raise Failure(describe_problem(error)) from None
+    except (urllib.error.URLError, ConnectionError, TimeoutError):
+        raise Failure(f"The scheduler isn't answering at {API}. Start it with: ./sched start") from None
+
+
+def describe_problem(error: urllib.error.HTTPError) -> str:
+    try:
+        problem = json.loads(error.read())
+    except ValueError:
+        return f"The API answered {error.code}."
+    lines = [problem.get("detail") or problem.get("title") or f"The API answered {error.code}."]
+    for field_error in problem.get("errors", []):
+        lines.append(f"  - {field_error.get('field')}: {field_error.get('message')}")
+    return "\n".join(lines)
+
+
+def submit(body: dict) -> dict:
+    """Posts a batch. The Idempotency-Key makes one retry after a dropped connection safe: the API
+    returns the experiment the first attempt created instead of creating a second one."""
+    headers = {"Idempotency-Key": f"sched-{uuid.uuid4()}"}
+    try:
+        return call("POST", "/experiments", body, headers)
+    except Failure as failure:
+        if "isn't answering" not in str(failure):
+            raise
+        time.sleep(1)
+        return call("POST", "/experiments", body, headers)
+
+
+def latest_experiment_id() -> int:
+    experiments = call("GET", "/experiments?limit=1")["experiments"]
+    if not experiments:
+        raise Failure("There are no experiments yet. Submit one with: ./sched sweep")
+    return experiments[0]["id"]
+
+
+# --- Formatting -----------------------------------------------------------------------------------
+
+def bar(progress: dict, width: int = 24) -> str:
+    total = progress["total"] or 1
+    done = progress["succeeded"] + progress["failed"]
+    filled = width * done // total
+    return f"[{'#' * filled}{'.' * (width - filled)}] {100 * done // total:3d}%"
+
+
+def counts(progress: dict) -> str:
+    return (f"{progress['succeeded']} succeeded, {progress['failed']} failed, "
+            f"{progress['running']} running, {progress['queued']} queued")
+
+
+def table(header: list, rows: list) -> None:
+    if not rows:
+        return
+    cells = [[str(value) for value in row] for row in [header] + rows]
+    widths = [max(len(row[i]) for row in cells) for i in range(len(header))]
+    for row in cells:
+        print("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+
+def config_summary(config: dict) -> str:
+    return (f"{config['optimizer']} lr={config['learningRate']:g} {config['hiddenUnits']}x{config['hiddenLayers']} "
+            f"batch={config['batchSize']} epochs={config['epochs']}")
+
+
+def local_time(instant: str | None) -> str:
+    if not instant:
+        return "-"
+    head, _, fraction = instant.rstrip("Z").partition(".")
+    moment = datetime.fromisoformat(f"{head}.{(fraction + '000000')[:6]}+00:00")
+    return moment.astimezone().strftime("%H:%M:%S")
+
+
+def done(progress: dict) -> bool:
+    return progress["queued"] + progress["running"] == 0
+
+
+# --- Commands: the stack --------------------------------------------------------------------------
+
+def compose(*args: str, check: bool = True) -> int:
+    if shutil.which("docker") is None:
+        raise Failure("Docker is not installed. Get it from https://docs.docker.com/get-docker/")
+    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        raise Failure("Docker is not running. Start Docker, then try again.")
+    code = subprocess.run(["docker", "compose", *args], cwd=ROOT).returncode
+    if check and code != 0:
+        raise Failure(f"docker compose {' '.join(args)} failed (exit {code}).")
+    return code
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    print("Starting PostgreSQL, the API, and workers. The first start builds the images, which takes a few minutes.",
+          flush=True)
+    compose("up", "-d", "--build", "--wait", "--scale", f"worker={args.workers}")
+    print(f"\nReady: the API is on {API}, with {args.workers} worker(s). Next: ./sched sweep")
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    print("Stopping. Busy workers finish and report their current job first.")
+    compose("down", *(["-v"] if args.delete_data else []))
+    print("Stopped. " + ("The data was deleted." if args.delete_data else "Your data is kept (--delete-data removes it)."))
+
+
+def cmd_workers(args: argparse.Namespace) -> None:
+    compose("up", "-d", "--no-recreate", "--scale", f"worker={args.count}", "worker")
+    print(f"{args.count} worker(s) running.")
+
+
+def cmd_logs(args: argparse.Namespace) -> None:
+    follow = ["-f", f"--tail={args.lines}"] if args.follow else []
+    command = ["docker", "compose", "logs", "--no-log-prefix", *follow, "api", "worker"]
+    process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    events = []
+    try:
+        for line in process.stdout:
+            event = parse_event(line)
+            if event is None or (args.job is not None and event.get("jobId") != args.job):
+                continue
+            if args.follow:
+                print(format_event(event), flush=True)
+            else:
+                events.append(event)
+    except KeyboardInterrupt:
+        process.terminate()
+        return
+    process.wait()
+    events.sort(key=lambda event: sortable_time(event.get("@timestamp", "")))
+    for event in events[-args.lines:]:
+        print(format_event(event))
+
+
+def parse_event(line: str) -> dict | None:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def sortable_time(instant: str) -> str:
+    # The API prints up to 9 fractional digits and the worker 6; pad them so strings sort by time.
+    head, _, fraction = instant.rstrip("Z").partition(".")
+    return f"{head}.{(fraction + '000000000')[:9]}"
+
+
+def format_event(event: dict) -> str:
+    source = "api" if event.get("service", {}).get("name") == "scheduler-api" else f"worker {event.get('workerId', '?')}"
+    level = event.get("log", {}).get("level", "")
+    return f"{local_time(event.get('@timestamp'))}  {source:<22} {level:<5}  {event.get('message', '')}"
+
+
+# --- Commands: experiments ------------------------------------------------------------------------
+
+def cmd_sweep(args: argparse.Namespace) -> None:
+    if not 1 <= args.seeds <= MAX_JOBS // 100:
+        raise Failure(f"--seeds must be between 1 and {MAX_JOBS // 100}: the grid has 100 configurations, "
+                      f"and an experiment holds at most {MAX_JOBS} jobs.")
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from make_sweep import sweep_request
+    experiment = submit(sweep_request(name=args.name, seeds=args.seeds, epochs=args.epochs))
+    print(f"Submitted experiment {experiment['id']} \"{experiment['name']}\": {experiment['progress']['total']} jobs "
+          f"(100 configurations x {args.seeds} seed(s), {args.epochs} epochs each).")
+    print("Follow it with: ./sched watch")
+
+
+def cmd_submit(args: argparse.Namespace) -> None:
+    try:
+        body = json.loads(Path(args.file).read_text())
+    except OSError as error:
+        raise Failure(f"Can't read {args.file}: {error.strerror}.") from None
+    except ValueError as error:
+        raise Failure(f"{args.file} is not valid JSON: {error}.") from None
+    experiment = submit(body)
+    print(f"Submitted experiment {experiment['id']} \"{experiment['name']}\": {experiment['progress']['total']} jobs.")
+    print("Follow it with: ./sched watch")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    experiments = call("GET", f"/experiments?limit={args.limit}")["experiments"]
+    if not experiments:
+        print("There are no experiments yet. Submit one with: ./sched sweep")
+        return
+    table(["ID", "NAME", "PROGRESS", "SUCCEEDED", "FAILED", "RUNNING", "QUEUED", "CREATED"],
+          [[e["id"], e["name"], bar(e["progress"], 12), e["progress"]["succeeded"], e["progress"]["failed"],
+            e["progress"]["running"], e["progress"]["queued"], local_time(e["createdAt"])] for e in experiments])
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    experiment = call("GET", f"/experiments/{args.id or latest_experiment_id()}")
+    progress = experiment["progress"]
+    print(f"Experiment {experiment['id']} \"{experiment['name']}\": {progress['total']} jobs, "
+          f"up to {experiment['maxAttempts']} attempts each")
+    print(f"{bar(progress)}  {counts(progress)}")
+    if done(progress):
+        print(f"Finished. See the results with: ./sched best {experiment['id']}")
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    experiment_id = args.id or latest_experiment_id()
+    started = time.monotonic()
+    interactive = sys.stdout.isatty()
+    last = None
+    try:
+        while True:
+            experiment = call("GET", f"/experiments/{experiment_id}")
+            progress = experiment["progress"]
+            line = f"Experiment {experiment_id}: {bar(progress)}  {counts(progress)}"
+            if interactive:
+                print(f"\r{line}  ({time.monotonic() - started:.0f} s)\033[K", end="", flush=True)
+            elif line != last:
+                print(line, flush=True)
+            last = line
+            if done(progress):
+                break
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopped watching; the experiment keeps running.")
+        return
+    print("\n" if interactive else "", end="")
+    print(f"Finished in {time.monotonic() - started:.0f} s. The best configurations:")
+    show_best(experiment_id, 5)
+
+
+def cmd_best(args: argparse.Namespace) -> None:
+    show_best(args.id or latest_experiment_id(), args.n)
+
+
+def show_best(experiment_id: int, limit: int) -> None:
+    jobs = call("GET", f"/experiments/{experiment_id}/best?limit={limit}")["jobs"]
+    if not jobs:
+        print("No job has succeeded yet.")
+        return
+    table(["RANK", "VAL ACCURACY", "CONFIG", "SEED", "JOB"],
+          [[j["rank"], f"{j['valAccuracy']:.3f}", config_summary(j["config"]), j["seed"], j["jobId"]] for j in jobs])
+
+
+def cmd_jobs(args: argparse.Namespace) -> None:
+    jobs = call("GET", f"/experiments/{args.id or latest_experiment_id()}/jobs")["jobs"]
+    if args.failed:
+        jobs = [job for job in jobs if job["state"] == "FAILED" or job.get("lastError")]
+        if not jobs:
+            print("No job has failed.")
+            return
+    table(["JOB", "STATE", "ATTEMPTS", "VAL ACCURACY", "WORKER", "CONFIG", "LAST ERROR"],
+          [[j["id"], j["state"], f"{j['attemptCount']}/{j['maxAttempts']}",
+            "-" if j["valAccuracy"] is None else f"{j['valAccuracy']:.3f}", j["workerId"] or "-",
+            config_summary(j["config"]), (j.get("lastError") or {}).get("type", "")] for j in jobs])
+
+
+def cmd_job(args: argparse.Namespace) -> None:
+    job = call("GET", f"/jobs/{args.job_id}")
+    attempts = call("GET", f"/jobs/{args.job_id}/attempts")["attempts"]
+    print(f"Job {job['id']} of experiment {job['experimentId']}: {job['state']}, "
+          f"attempt {job['attemptCount']} of at most {job['maxAttempts']}")
+    print(f"Config: {config_summary(job['config'])}, seed {job['seed']}")
+    if job["result"]:
+        result = job["result"]
+        print(f"Result: val accuracy {result['valAccuracy']:.3f}, val loss {result['valLoss']:.4f}, "
+              f"trained in {result['trainingSeconds']:.2f} s")
+    print()
+    table(["ATTEMPT", "STATUS", "WORKER", "CLAIMED", "ENDED", "ERROR"],
+          [[a["attemptNumber"], a["status"], a["workerId"], local_time(a.get("claimedAt")),
+            local_time(a.get("finishedAt")), a.get("errorType") or ""] for a in attempts])
+
+
+# --- Commands: checks -----------------------------------------------------------------------------
+
+def run(command: list, cwd: Path = ROOT) -> int:
+    return subprocess.run(command, cwd=cwd).returncode
+
+
+def cmd_demo(args: argparse.Namespace) -> None:
+    raise SystemExit(run([str(ROOT / "scripts" / "demo.sh"), *args.scenarios]))
+
+
+def cmd_bench(args: argparse.Namespace) -> None:
+    raise SystemExit(run([str(ROOT / "scripts" / "benchmark.sh"), *args.parts]))
+
+
+def cmd_test(args: argparse.Namespace) -> None:
+    results = {}
+    print("== API tests (against a real PostgreSQL in Docker)")
+    if has_java_21():
+        results["API"] = run(["./mvnw", "-B", "-ntp", "verify"], cwd=ROOT / "api")
+    else:
+        results["API"] = run([str(ROOT / "scripts" / "mvnw-docker.sh"), "verify"])
+    print("\n== Worker tests")
+    if shutil.which("uv"):
+        results["worker"] = run(["uv", "run", "pytest"], cwd=ROOT / "worker")
+    else:  # the same interpreter and uv as the worker image, in a throwaway container
+        results["worker"] = run([
+            "docker", "run", "--rm", "-v", f"{ROOT / 'worker'}:/src:ro", "-v", "ml-scheduler-uv:/root/.cache/uv",
+            "-e", "OMP_NUM_THREADS=1", "python:3.14.7-slim-trixie", "sh", "-c",
+            "pip install -q --root-user-action=ignore uv==0.12.20 && mkdir /work "
+            "&& tar -C /src --exclude=.venv --exclude=.pytest_cache -cf - . | tar -C /work -xf - "
+            "&& cd /work && uv sync --locked -q && uv run --no-sync pytest"])
+    print()
+    for suite, code in results.items():
+        print(f"{suite} tests: {'passed' if code == 0 else 'FAILED'}")
+    raise SystemExit(0 if all(code == 0 for code in results.values()) else 1)
+
+
+def has_java_21() -> bool:
+    if shutil.which("java") is None:
+        return False
+    version = subprocess.run(["java", "-version"], capture_output=True, text=True).stderr
+    return '"21' in version
+
+
+# --- Main -----------------------------------------------------------------------------------------
+
+OVERVIEW = f"""Usage: ./sched COMMAND [options]            (./sched COMMAND -h shows a command's options)
+
+Run the scheduler
+  start [--workers N]      start PostgreSQL, the API, and N workers (default 2)
+  workers N                change how many workers run
+  logs [-f] [--job ID]     readable logs of the API and the workers
+  stop [--delete-data]     stop everything; the data is kept unless you ask
+
+Run experiments            (ID defaults to the latest experiment)
+  sweep [--seeds N]        submit the built-in grid: 100 configurations x N seeds
+  submit FILE              submit a batch from a JSON file, e.g. examples/small-batch.json
+  list                     recent experiments and their progress
+  status [ID]              an experiment's progress
+  watch [ID]               follow an experiment until it finishes, then show the best
+  best [ID] [-n N]         the best configurations
+  jobs [ID] [--failed]     every job of an experiment
+  job JOB_ID               one job and its attempt history
+
+Check it
+  demo                     break things on purpose and check the scheduler copes (about 100 s)
+  test                     run the API and worker test suites
+  bench                    measure throughput and latency (about 7 minutes)
+
+The API is at {API} (set SCHED_API to change it)."""
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(prog="./sched", description="Run the ML experiment scheduler and its experiments.",
+                                   epilog=f"The API address is {API} (set SCHED_API to change it).")
+    commands = main.add_subparsers(dest="command", metavar="COMMAND")
+
+    def command(name: str, handler, help_text: str) -> argparse.ArgumentParser:
+        sub = commands.add_parser(name, help=help_text, description=help_text)
+        sub.set_defaults(handler=handler)
+        return sub
+
+    def optional_id(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("id", nargs="?", type=int, help="an experiment id (default: the latest)")
+
+    sub = command("start", cmd_start, "start PostgreSQL, the API, and workers")
+    sub.add_argument("--workers", type=int, default=2, help="how many workers (default 2)")
+    sub = command("stop", cmd_stop, "stop everything; the data is kept")
+    sub.add_argument("--delete-data", action="store_true", help="also delete the database")
+    sub = command("workers", cmd_workers, "change how many workers run")
+    sub.add_argument("count", type=int)
+    sub = command("sweep", cmd_sweep, "submit the built-in grid: 100 configurations x seeds")
+    sub.add_argument("--seeds", type=int, default=1, help="runs per configuration (default 1, at most 5)")
+    sub.add_argument("--epochs", type=int, default=20, help="training epochs per job (default 20)")
+    sub.add_argument("--name", default="grid-sweep")
+    sub = command("submit", cmd_submit, "submit a batch from a JSON file, e.g. examples/small-batch.json")
+    sub.add_argument("file")
+    sub = command("list", cmd_list, "recent experiments and their progress")
+    sub.add_argument("--limit", type=int, default=20)
+    optional_id(command("status", cmd_status, "an experiment's progress"))
+    optional_id(command("watch", cmd_watch, "follow an experiment until it finishes, then show the best results"))
+    sub = command("best", cmd_best, "an experiment's best configurations")
+    optional_id(sub)
+    sub.add_argument("-n", type=int, default=10, help="how many (default 10)")
+    sub = command("jobs", cmd_jobs, "every job of an experiment")
+    optional_id(sub)
+    sub.add_argument("--failed", action="store_true", help="only jobs that failed or had a failed attempt")
+    sub = command("job", cmd_job, "one job and its attempt history")
+    sub.add_argument("job_id", type=int)
+    sub = command("logs", cmd_logs, "readable logs of the API and the workers")
+    sub.add_argument("-f", "--follow", action="store_true", help="keep printing new lines")
+    sub.add_argument("-n", "--lines", type=int, default=40, help="how many of the latest lines (default 40)")
+    sub.add_argument("--job", type=int, help="only lines about this job")
+    sub = command("demo", cmd_demo, "break things on purpose and check the scheduler copes (about 100 s)")
+    sub.add_argument("scenarios", nargs="*", help="sweep, crash, stale (default: all)")
+    command("test", cmd_test, "run the API and worker test suites")
+    sub = command("bench", cmd_bench, "measure throughput and latency (about 7 minutes)")
+    sub.add_argument("parts", nargs="*", help="api, training (default: both)")
+    commands.add_parser("help", help="show this help")
+    return main
+
+
+def main() -> None:
+    sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with docker's output
+    cli = parser()
+    args = cli.parse_args()
+    if args.command in (None, "help"):
+        print(OVERVIEW)
+        return
+    try:
+        args.handler(args)
+    except Failure as failure:
+        print(failure, file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    main()

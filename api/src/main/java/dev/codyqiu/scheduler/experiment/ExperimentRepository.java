@@ -1,6 +1,9 @@
 package dev.codyqiu.scheduler.experiment;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Optional;
 
 import dev.codyqiu.scheduler.experiment.ExperimentResponse.Progress;
@@ -20,19 +23,41 @@ public class ExperimentRepository {
 		this.jdbc = jdbc;
 	}
 
-	/** Must run inside the transaction that also inserts the experiment's jobs. */
+	/**
+	 * Inserts the experiment row unless another experiment already owns {@code idempotencyKey}.
+	 * Must run inside the transaction that also inserts the experiment's jobs.
+	 *
+	 * <p>If a concurrent transaction has inserted the same key but not committed yet, PostgreSQL
+	 * makes this statement wait for it. If that transaction commits, nothing is inserted here and
+	 * the caller finds its row; if it rolls back, this insert proceeds. A null key never conflicts.
+	 * @return the new experiment's id, or empty if the key was already taken
+	 */
 	@Transactional(propagation = Propagation.MANDATORY)
-	public long insert(String name, Task task, int maxAttempts) {
+	public Optional<Long> insert(String name, Task task, int maxAttempts, String idempotencyKey, String fingerprint) {
 		return jdbc.sql("""
-				INSERT INTO experiments (name, task, max_attempts)
-				VALUES (:name, :task, :maxAttempts)
+				INSERT INTO experiments (name, task, max_attempts, idempotency_key, request_fingerprint)
+				VALUES (:name, :task, :maxAttempts, :idempotencyKey, :fingerprint)
+				ON CONFLICT (idempotency_key) DO NOTHING
 				RETURNING id
 				""")
 			.param("name", name)
 			.param("task", task.id())
 			.param("maxAttempts", maxAttempts)
+			.param("idempotencyKey", idempotencyKey)
+			.param("fingerprint", fingerprint)
 			.query(Long.class)
-			.single();
+			.optional();
+	}
+
+	/**
+	 * The experiment that owns {@code idempotencyKey}. A new statement takes a new snapshot under
+	 * READ COMMITTED, so this sees a row committed by the transaction an insert just waited for.
+	 */
+	Optional<StoredKey> findByIdempotencyKey(String idempotencyKey) {
+		return jdbc.sql("SELECT id, request_fingerprint FROM experiments WHERE idempotency_key = :key")
+			.param("key", idempotencyKey)
+			.query((rs, rowNum) -> new StoredKey(rs.getLong("id"), rs.getString("request_fingerprint")))
+			.optional();
 	}
 
 	/**
@@ -53,15 +78,38 @@ public class ExperimentRepository {
 				GROUP BY e.id
 				""")
 			.param("id", id)
-			.query((rs, rowNum) -> new ExperimentResponse(
-					rs.getLong("id"),
-					rs.getString("name"),
-					Task.fromId(rs.getString("task")),
-					rs.getInt("max_attempts"),
-					rs.getObject("created_at", OffsetDateTime.class).toInstant(),
-					new Progress(rs.getInt("total"), rs.getInt("queued"), rs.getInt("running"),
-							rs.getInt("succeeded"), rs.getInt("failed"))))
+			.query(ExperimentRepository::withProgress)
 			.optional();
+	}
+
+	/** The newest experiments first, each with its progress, all from one statement's snapshot. */
+	public List<ExperimentResponse> findRecentWithProgress(int limit) {
+		return jdbc.sql("""
+				SELECT e.id, e.name, e.task, e.max_attempts, e.created_at,
+				       count(j.id)                                     AS total,
+				       count(j.id) FILTER (WHERE j.state = 'QUEUED')    AS queued,
+				       count(j.id) FILTER (WHERE j.state = 'RUNNING')   AS running,
+				       count(j.id) FILTER (WHERE j.state = 'SUCCEEDED') AS succeeded,
+				       count(j.id) FILTER (WHERE j.state = 'FAILED')    AS failed
+				FROM (SELECT * FROM experiments ORDER BY id DESC LIMIT :limit) e
+				LEFT JOIN jobs j ON j.experiment_id = e.id
+				GROUP BY e.id, e.name, e.task, e.max_attempts, e.created_at
+				ORDER BY e.id DESC
+				""")
+			.param("limit", limit)
+			.query(ExperimentRepository::withProgress)
+			.list();
+	}
+
+	private static ExperimentResponse withProgress(ResultSet rs, int rowNum) throws SQLException {
+		return new ExperimentResponse(
+				rs.getLong("id"),
+				rs.getString("name"),
+				Task.fromId(rs.getString("task")),
+				rs.getInt("max_attempts"),
+				rs.getObject("created_at", OffsetDateTime.class).toInstant(),
+				new Progress(rs.getInt("total"), rs.getInt("queued"), rs.getInt("running"), rs.getInt("succeeded"),
+						rs.getInt("failed")));
 	}
 
 	public boolean exists(long id) {

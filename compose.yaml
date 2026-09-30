@@ -1,4 +1,5 @@
-# Local stack: PostgreSQL + the scheduler API. Credentials are for local development only.
+# Local stack: PostgreSQL, the scheduler API, and training workers.
+# Credentials are for local development only. More workers: docker compose up --scale worker=3
 name: ml-scheduler
 
 services:
@@ -28,6 +29,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/scheduler
       SPRING_DATASOURCE_USERNAME: scheduler
       SPRING_DATASOURCE_PASSWORD: scheduler
+      # One JSON object per line, in Spring Boot's Elastic Common Schema format (see docs/DESIGN.md).
+      LOGGING_STRUCTURED_FORMAT_CONSOLE: ecs
     ports:
       - "127.0.0.1:${API_PORT:-8080}:8080"
     depends_on:
@@ -39,6 +42,21 @@ services:
       timeout: 3s
       retries: 40
       start_period: 10s
+
+  worker:
+    build: ./worker
+    environment:
+      SCHEDULER_API_URL: http://api:8080
+      # The same JSON shape as the API's, so one query follows a job through both.
+      LOG_FORMAT: json
+    depends_on:
+      api:
+        condition: service_healthy
+    # One CPU per worker, matching its single PyTorch thread (see worker/Dockerfile), so adding
+    # workers adds parallelism instead of oversubscribing cores.
+    cpus: 1.0
+    # SIGTERM lets a busy worker finish and report its current job; SIGKILL follows after this.
+    stop_grace_period: 60s
 
 volumes:
   postgres-data:

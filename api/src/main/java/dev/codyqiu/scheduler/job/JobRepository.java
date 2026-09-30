@@ -7,8 +7,12 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
+import dev.codyqiu.scheduler.lease.SchedulerProperties.Lease;
 import dev.codyqiu.scheduler.task.SyntheticMlpConfig;
+import dev.codyqiu.scheduler.task.Task;
+import dev.codyqiu.scheduler.task.TrainingMetrics;
 import tools.jackson.databind.json.JsonMapper;
 
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -20,10 +24,23 @@ import org.springframework.transaction.annotation.Transactional;
 @Repository
 public class JobRepository {
 
+	/**
+	 * Jobs with the reason their latest unsuccessful attempt ended. LATERAL runs the subquery once
+	 * per job row, walking that job's attempts newest first through the (job_id, attempt_number)
+	 * index.
+	 */
 	private static final String SELECT_JOBS = """
-			SELECT id, experiment_id, job_index, seed, config, state, attempt_count, max_attempts,
-			       worker_id, val_accuracy, result, created_at, started_at, finished_at
-			FROM jobs
+			SELECT j.id, j.experiment_id, j.job_index, j.seed, j.config, j.state, j.attempt_count, j.max_attempts,
+			       j.worker_id, j.val_accuracy, j.result, j.created_at, j.started_at, j.finished_at,
+			       j.lease_expires_at, e.attempt_number AS error_attempt, e.error_type, e.error_message
+			FROM jobs j
+			LEFT JOIN LATERAL (
+			    SELECT attempt_number, error_type, error_message
+			    FROM attempts a
+			    WHERE a.job_id = j.id AND a.error_type IS NOT NULL
+			    ORDER BY a.attempt_number DESC
+			    LIMIT 1
+			) e ON true
 			""";
 
 	private final JdbcClient jdbc;
@@ -56,15 +73,253 @@ public class JobRepository {
 				""", rows);
 	}
 
+	/**
+	 * Claims the oldest queued job for {@code workerId}, starts a new attempt of it, and grants that
+	 * attempt a lease. Returns empty when no queued job can be locked at this moment.
+	 *
+	 * <p>This is one statement. The CTE locks a single queued row; {@code SKIP LOCKED} makes it pass
+	 * over rows that concurrent claims have already locked instead of waiting for them. The UPDATE
+	 * then moves the locked row to RUNNING under a freshly generated attempt id. Because a row lock
+	 * has exactly one holder, two concurrent claims can never return the same job. The caller's
+	 * transaction also records the attempt row.
+	 */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public Optional<JobAssignment> claimNext(String workerId, Lease lease) {
+		return jdbc.sql("""
+				WITH next_job AS (
+				    SELECT id
+				    FROM jobs
+				    WHERE state = 'QUEUED'
+				    ORDER BY id
+				    LIMIT 1
+				    FOR UPDATE SKIP LOCKED
+				)
+				UPDATE jobs j
+				SET state = 'RUNNING',
+				    attempt_count = j.attempt_count + 1,
+				    current_attempt_id = gen_random_uuid(),
+				    worker_id = :workerId,
+				    started_at = now(),
+				    lease_expires_at = now() + make_interval(secs => :leaseSeconds)
+				FROM next_job, experiments e
+				WHERE j.id = next_job.id
+				  AND e.id = j.experiment_id
+				RETURNING j.id, j.current_attempt_id, j.attempt_count, j.experiment_id, e.task, j.seed, j.config,
+				          j.lease_expires_at
+				""")
+			.param("workerId", workerId)
+			.param("leaseSeconds", lease.durationSeconds())
+			.query((rs, rowNum) -> new JobAssignment(
+					rs.getLong("id"),
+					rs.getObject("current_attempt_id", UUID.class),
+					rs.getInt("attempt_count"),
+					rs.getLong("experiment_id"),
+					Task.fromId(rs.getString("task")),
+					rs.getInt("seed"),
+					jsonMapper.readValue(rs.getString("config"), SyntheticMlpConfig.class),
+					instant(rs, "lease_expires_at"),
+					lease.durationSeconds(),
+					lease.heartbeatIntervalSeconds()))
+			.optional();
+	}
+
+	/**
+	 * Extends the lease if, and only if, {@code attemptId} is the running attempt of the job and
+	 * its lease has not yet passed. The strict check means an expired attempt cannot revive itself,
+	 * even before recovery has noticed the expiry.
+	 * @return the new expiry (database time), or empty if the renewal was rejected
+	 */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public Optional<Instant> renewLease(long jobId, UUID attemptId, Lease lease) {
+		return jdbc.sql("""
+				UPDATE jobs
+				SET lease_expires_at = now() + make_interval(secs => :leaseSeconds)
+				WHERE id = :jobId
+				  AND state = 'RUNNING'
+				  AND current_attempt_id = :attemptId
+				  AND lease_expires_at > now()
+				RETURNING lease_expires_at
+				""")
+			.param("leaseSeconds", lease.durationSeconds())
+			.param("jobId", jobId)
+			.param("attemptId", attemptId)
+			.query((rs, rowNum) -> instant(rs, "lease_expires_at"))
+			.optional();
+	}
+
+	/**
+	 * Records a successful result if, and only if, {@code attemptId} is the running attempt of the
+	 * job and still holds an unexpired lease. The WHERE clause is the entire authorization check,
+	 * and it is evaluated atomically with the write: if another transaction changed the row first,
+	 * PostgreSQL waits for that change to commit and re-checks the clause against the new row
+	 * before writing.
+	 * @return {@code true} if the result was accepted (one row updated); {@code false} otherwise
+	 */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public boolean markSucceeded(long jobId, UUID attemptId, TrainingMetrics metrics) {
+		int updated = jdbc.sql("""
+				UPDATE jobs
+				SET state = 'SUCCEEDED',
+				    val_accuracy = :valAccuracy,
+				    result = CAST(:result AS jsonb),
+				    finished_at = now(),
+				    lease_expires_at = NULL
+				WHERE id = :jobId
+				  AND state = 'RUNNING'
+				  AND current_attempt_id = :attemptId
+				  AND lease_expires_at > now()
+				""")
+			.param("valAccuracy", metrics.valAccuracy())
+			.param("result", jsonMapper.writeValueAsString(metrics))
+			.param("jobId", jobId)
+			.param("attemptId", attemptId)
+			.update();
+		return updated == 1;
+	}
+
+	/**
+	 * Ends the attempt with a reported failure if, and only if, it is the running attempt of the job
+	 * with a live lease: the same guard as completion. One statement both checks and decides. A
+	 * retryable failure with attempts left returns the job to the queue; anything else fails it for
+	 * good. (PostgreSQL evaluates every SET expression against the old row, so each CASE sees the
+	 * same attempt_count.)
+	 * @return the job's new state, or empty if the report was rejected
+	 */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public Optional<FailedAttempt> markFailed(long jobId, UUID attemptId, boolean retryable) {
+		return jdbc.sql("""
+				UPDATE jobs
+				SET state              = CASE WHEN :retry AND attempt_count < max_attempts THEN 'QUEUED' ELSE 'FAILED' END,
+				    current_attempt_id = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE current_attempt_id END,
+				    worker_id          = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE worker_id END,
+				    started_at         = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE started_at END,
+				    finished_at        = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE now() END,
+				    lease_expires_at   = NULL
+				WHERE id = :jobId
+				  AND state = 'RUNNING'
+				  AND current_attempt_id = :attemptId
+				  AND lease_expires_at > now()
+				RETURNING state, attempt_count, max_attempts
+				""")
+			.param("retry", retryable)
+			.param("jobId", jobId)
+			.param("attemptId", attemptId)
+			.query((rs, rowNum) -> new FailedAttempt(JobState.valueOf(rs.getString("state")),
+					rs.getInt("attempt_count"), rs.getInt("max_attempts")))
+			.optional();
+	}
+
+	/** Whether the job's accepted result equals {@code metrics}, compared as JSONB (by meaning, not text). */
+	public boolean resultMatches(long jobId, TrainingMetrics metrics) {
+		return jdbc.sql("SELECT COALESCE(result = CAST(:result AS jsonb), false) FROM jobs WHERE id = :jobId")
+			.param("result", jsonMapper.writeValueAsString(metrics))
+			.param("jobId", jobId)
+			.query(Boolean.class)
+			.single();
+	}
+
+	/**
+	 * Successful jobs ranked by validation accuracy (larger is better), ties broken by position in
+	 * the batch so the order is deterministic. An experiment has at most 500 jobs, so sorting them
+	 * through the experiment's index needs no index of its own.
+	 */
+	public List<RankedJob> findBest(long experimentId, int limit) {
+		return jdbc.sql("""
+				SELECT id, job_index, seed, config, val_accuracy, result
+				FROM jobs
+				WHERE experiment_id = :experimentId AND state = 'SUCCEEDED'
+				ORDER BY val_accuracy DESC, job_index
+				LIMIT :limit
+				""")
+			.param("experimentId", experimentId)
+			.param("limit", limit)
+			.query((rs, rowNum) -> new RankedJob(rowNum + 1, rs.getLong("id"), rs.getInt("job_index"),
+					rs.getInt("seed"), jsonMapper.readValue(rs.getString("config"), SyntheticMlpConfig.class),
+					rs.getDouble("val_accuracy"), jsonMapper.readValue(rs.getString("result"), TrainingMetrics.class)))
+			.list();
+	}
+
+	/** Explains an already-rejected request by {@code attemptId}. Never used to decide a write. */
+	public Optional<AttemptStanding> findStanding(long jobId, UUID attemptId) {
+		return jdbc.sql("""
+				SELECT state,
+				       COALESCE(current_attempt_id = :attemptId, false) AS is_current,
+				       COALESCE(lease_expires_at <= now(), false) AS lease_expired
+				FROM jobs
+				WHERE id = :jobId
+				""")
+			.param("jobId", jobId)
+			.param("attemptId", attemptId)
+			.query((rs, rowNum) -> new AttemptStanding(JobState.valueOf(rs.getString("state")),
+					rs.getBoolean("is_current"), rs.getBoolean("lease_expired")))
+			.optional();
+	}
+
+	/**
+	 * Locks up to {@code limit} RUNNING jobs whose lease has passed, oldest expiry first. Rows that
+	 * another transaction holds (a completion or heartbeat in flight, or another sweep) are skipped
+	 * rather than waited for. The locks last until the caller's transaction ends, so nothing can
+	 * change these rows before they are recovered.
+	 */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public List<ExpiredLease> lockExpiredLeases(int limit) {
+		return jdbc.sql("""
+				SELECT id, current_attempt_id, attempt_count, max_attempts, worker_id
+				FROM jobs
+				WHERE state = 'RUNNING'
+				  AND lease_expires_at <= now()
+				ORDER BY lease_expires_at
+				LIMIT :limit
+				FOR UPDATE SKIP LOCKED
+				""")
+			.param("limit", limit)
+			.query((rs, rowNum) -> new ExpiredLease(rs.getLong("id"), rs.getObject("current_attempt_id", UUID.class),
+					rs.getInt("attempt_count"), rs.getInt("max_attempts"), rs.getString("worker_id")))
+			.list();
+	}
+
+	/** Returns locked, expired jobs that still have attempts left to the queue. */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public int requeue(List<Long> jobIds) {
+		return jdbc.sql("""
+				UPDATE jobs
+				SET state = 'QUEUED', current_attempt_id = NULL, worker_id = NULL, started_at = NULL,
+				    lease_expires_at = NULL
+				WHERE id IN (:jobIds)
+				  AND state = 'RUNNING'
+				  AND attempt_count < max_attempts
+				""")
+			.param("jobIds", jobIds)
+			.update();
+	}
+
+	/** Fails locked, expired jobs whose final attempt this was. They keep their last attempt's identity. */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public int failExhausted(List<Long> jobIds) {
+		return jdbc.sql("""
+				UPDATE jobs
+				SET state = 'FAILED', lease_expires_at = NULL, finished_at = now()
+				WHERE id IN (:jobIds)
+				  AND state = 'RUNNING'
+				  AND attempt_count >= max_attempts
+				""")
+			.param("jobIds", jobIds)
+			.update();
+	}
+
+	public boolean exists(long id) {
+		return jdbc.sql("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = :id)").param("id", id).query(Boolean.class).single();
+	}
+
 	public Optional<JobResponse> findById(long id) {
-		return jdbc.sql(SELECT_JOBS + "WHERE id = :id")
+		return jdbc.sql(SELECT_JOBS + "WHERE j.id = :id")
 			.param("id", id)
 			.query(this::mapJob)
 			.optional();
 	}
 
 	public List<JobResponse> findByExperimentId(long experimentId) {
-		return jdbc.sql(SELECT_JOBS + "WHERE experiment_id = :experimentId ORDER BY job_index")
+		return jdbc.sql(SELECT_JOBS + "WHERE j.experiment_id = :experimentId ORDER BY j.job_index")
 			.param("experimentId", experimentId)
 			.query(this::mapJob)
 			.list();
@@ -83,10 +338,14 @@ public class JobRepository {
 				rs.getInt("max_attempts"),
 				rs.getString("worker_id"),
 				rs.getObject("val_accuracy", Double.class),
-				(result != null) ? jsonMapper.readTree(result) : null,
+				(result != null) ? jsonMapper.readValue(result, TrainingMetrics.class) : null,
 				instant(rs, "created_at"),
 				instant(rs, "started_at"),
-				instant(rs, "finished_at"));
+				instant(rs, "finished_at"),
+				instant(rs, "lease_expires_at"),
+				(rs.getString("error_type") != null)
+						? new JobError(rs.getInt("error_attempt"), rs.getString("error_type"), rs.getString("error_message"))
+						: null);
 	}
 
 	private static Instant instant(ResultSet rs, String column) throws SQLException {

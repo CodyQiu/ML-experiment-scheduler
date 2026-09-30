@@ -92,22 +92,55 @@ limits*, such as 500 jobs per batch or `learningRate` ≤ 1, which can change wi
 There is deliberately no index on `val_accuracy`. A best-of-experiment query reads at most 500
 rows through the experiment index. An index would be added only if a measured query needs it.
 
-### V2: reliability (planned)
+### V2: leases and attempt history (implemented, `V2__leases_and_attempts.sql`)
 
-- `jobs.lease_expires_at timestamptz`. Present exactly when the job is `RUNNING` (CHECK). It is the
-  end of the current attempt's authority, in database time.
-- **`attempts`**, which records history and backs the invariants at the database level:
-  - `id uuid` PK. This is the attempt id handed to the worker, equal to `jobs.current_attempt_id`
-    while the attempt runs.
-  - `job_id`, `attempt_number` with `UNIQUE (job_id, attempt_number)`.
-  - `worker_id`, `claimed_at`, `last_heartbeat_at`, `finished_at`.
-  - `status`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `EXPIRED`.
-  - `error_type`, `error_message`, `retryable`.
-  - Partial unique index `(job_id) WHERE status = 'RUNNING'`: at most one live attempt per job.
-  - Partial unique index `(job_id) WHERE status = 'SUCCEEDED'`: at most one accepted success per job.
-- `experiments.idempotency_key text UNIQUE` and `experiments.request_fingerprint text`, both set or
-  both null (CHECK). The key is global in scope, which is enough for a single-user local service.
-- An index on `jobs (lease_expires_at) WHERE state = 'RUNNING'` for the recovery sweep.
+**`jobs.lease_expires_at timestamptz`.** The end of the current attempt's authority, in database
+time.
+
+- `jobs_lease_iff_running` makes it present exactly when the job is `RUNNING`.
+- The partial index `jobs_running_lease_idx` on `(lease_expires_at) WHERE state = 'RUNNING'` serves
+  the recovery sweep.
+
+**`attempts`**: one row per claim. It records history, and it backs two invariants at the database
+level.
+
+| Column | Purpose |
+|---|---|
+| `id uuid` PK | The attempt id handed to the worker; equals `jobs.current_attempt_id` while the attempt runs |
+| `job_id`, `attempt_number` | `UNIQUE (job_id, attempt_number)`, which also serves "history of job X" in order |
+| `worker_id`, `claimed_at`, `last_heartbeat_at`, `finished_at` | Who ran it, and when |
+| `status` | `RUNNING`, `SUCCEEDED`, `FAILED`, or `EXPIRED`. `finished_at` is present exactly when the status is not `RUNNING` |
+| `error_type`, `error_message` | Why it ended unsuccessfully (e.g. `LEASE_EXPIRED`). Allowed only for `FAILED` or `EXPIRED` |
+
+- The partial unique index `attempts_one_running_per_job` allows at most one live attempt per job.
+- The partial unique index `attempts_one_success_per_job` allows at most one accepted success per
+  job.
+
+**The migration handles existing rows** (covered by `MigrationTests`):
+
+- Jobs that were `RUNNING` under V1 had no lease and could never be recovered. They get an
+  already-expired lease, so the first sweep recovers them.
+- Every claimed job gets an attempts row for its latest attempt, mirroring the job's state.
+  Recovery needs that row: it marks the attempt `EXPIRED` and checks that exactly one row changed.
+
+### V3: reported failures (implemented, `V3__reported_failures.sql`)
+
+- **`attempts.retryable boolean`** records the worker's judgment on a reported failure.
+- **`attempts_error_iff_unsuccessful`** replaces V2's weaker constraint. Every `FAILED` or
+  `EXPIRED` attempt must carry an `error_type`, and no other attempt may.
+- **`attempts_retryable_iff_failed`**: a reported failure always says whether a retry was
+  requested.
+- **Backfill:** a `FAILED` attempt without a reason can only come from a job failed by hand under
+  V1. It becomes `UNKNOWN` and `retryable = false`. `MigrationTests` covers this.
+
+### V4: idempotency keys (implemented, `V4__idempotency_keys.sql`)
+
+- **`experiments.idempotency_key`** is `UNIQUE`: at most one experiment per key. `NULL`s never
+  conflict, so submissions without a key are unaffected.
+- **`experiments.request_fingerprint`** is a CHECK-enforced partner of the key: both set or both
+  null.
+- **Scope and lifetime.** The key is global in scope, which is enough for a single-user local
+  service. Keys never expire (Stripe, for comparison, forgets them after 24 h).
 
 ## Job lifecycle
 
@@ -116,21 +149,26 @@ rows through the experiment index. An index would be added only if a measured qu
  QUEUED ─────────▶ RUNNING ───────────────────────────────────────────────────▶ SUCCEEDED
    ▲                 │  │
    │                 │  └──────────────────────────────────────────────────────▶ FAILED
-   └─────────────────┘   non-retryable failure, or a retryable failure or lease
-   retryable failure or  expiry on the final attempt (planned)
-   lease expiry with
-   attempts left (planned)
+   └─────────────────┘   lease expiry on the final attempt;
+   lease expiry with     a non-retryable failure; a retryable
+   attempts left;        failure on the final attempt
+   a retryable failure
+   with attempts left
 ```
 
 Every transition is one `UPDATE` whose `WHERE` clause is the guard. The affected-row count decides
-whether the transition happened: 1 means accepted, 0 means rejected.
+whether the transition happened: 1 means accepted, 0 means rejected. Each transition also updates
+the attempt's row in the same transaction.
 
 | Transition | Trigger | Guard in the `WHERE` clause | When |
 |---|---|---|---|
-| QUEUED → RUNNING | worker claim | `state = 'QUEUED'`, row locked with `SKIP LOCKED` | next increment |
-| RUNNING → SUCCEEDED | worker complete | `state = 'RUNNING' AND current_attempt_id = :attempt` (M2 adds `AND lease_expires_at > now()`) | next increment |
-| RUNNING → QUEUED | retryable fail, or lease expiry | as above, and `attempt_count < max_attempts` | M2 |
-| RUNNING → FAILED | non-retryable fail, or budget exhausted | as above | M2 |
+| QUEUED → RUNNING | worker claim | `state = 'QUEUED'`, row locked with `SKIP LOCKED`; the lease starts | implemented |
+| RUNNING → RUNNING | heartbeat (renews the lease) | `state = 'RUNNING' AND current_attempt_id = :attempt AND lease_expires_at > now()` | implemented |
+| RUNNING → SUCCEEDED | worker complete | `state = 'RUNNING' AND current_attempt_id = :attempt AND lease_expires_at > now()` | implemented |
+| RUNNING → QUEUED | lease expiry with attempts left | the row is locked by the sweep (`state = 'RUNNING' AND lease_expires_at <= now()`, `SKIP LOCKED`), then `attempt_count < max_attempts` | implemented |
+| RUNNING → FAILED | lease expiry on the final attempt | the same lock, then `attempt_count >= max_attempts` | implemented |
+| RUNNING → QUEUED | retryable failure with attempts left | the running attempt's guard, and `:retryable AND attempt_count < max_attempts` | implemented |
+| RUNNING → FAILED | non-retryable failure, or a retryable one on the final attempt | the running attempt's guard, and the negation | implemented |
 
 `SUCCEEDED` and `FAILED` are terminal. No statement has a guard that matches a terminal row, so an
 accepted result can never be overwritten.
@@ -145,7 +183,7 @@ accepted result can never be overwritten.
   duplicate keys return 400. Integer literals are accepted for decimal fields.
 - Numbers are values, not spellings. A submitted `0.0001` may be echoed as `1.0E-4`, and PostgreSQL
   JSONB stores it as `0.00010`. All three are the same number. This is why request fingerprints
-  (M2) are computed from parsed values, never from JSON text.
+  are computed from parsed values, never from JSON text.
 - Errors use RFC 9457 problem details (`application/problem+json`) and always include a `code`.
   Field problems add `errors: [{field, message}]` with paths such as `jobs[1].config.epochs`.
   Bean Validation reports every violated constraint at once. A JSON type error stops parsing, so
@@ -153,16 +191,18 @@ accepted result can never be overwritten.
 
 | Endpoint | Purpose | Success | Errors | Status |
 |---|---|---|---|---|
-| `POST /experiments` | Submit a batch | `201` + `Location` | `400`; M2: `409` | implemented |
+| `POST /experiments` | Submit a batch (optional `Idempotency-Key`) | `201` + `Location`; `200` replay | `400`, `409` | implemented |
 | `GET /experiments/{id}` | Details + progress counts | `200` | `404` | implemented |
 | `GET /experiments/{id}/jobs` | Jobs in `jobIndex` order | `200` | `404` | implemented |
 | `GET /jobs/{id}` | One job | `200` | `404` | implemented |
 | `GET /actuator/health` | Liveness, including the database | `200` | `503` | implemented |
-| `POST /worker/jobs/claim` | Claim the oldest queued job | `200` assignment, `204` no work | `400` | next increment |
-| `POST /worker/jobs/{id}/complete` | Report success | `200` | `400`, `404`, `409` | next increment |
-| `POST /worker/jobs/{id}/heartbeat` | Renew the lease | `200` | `409` | M2 |
-| `POST /worker/jobs/{id}/fail` | Report a failure | `200` | `409` | M2 |
-| `GET /experiments/{id}/best?limit=N` | Top successful jobs by `valAccuracy` | `200` | `404` | M2 |
+| `POST /worker/jobs/claim` | Claim the oldest queued job | `200` assignment, `204` no work | `400` | implemented |
+| `POST /worker/jobs/{id}/complete` | Report success | `200` | `400`, `404`, `409` | implemented |
+| `POST /worker/jobs/{id}/heartbeat` | Renew the lease | `200` | `400`, `404`, `409` | implemented |
+| `POST /worker/jobs/{id}/fail` | Report a failure | `200` with the new state | `400`, `404`, `409` | implemented |
+| `GET /jobs/{id}/attempts` | Attempt history | `200` | `404` | implemented |
+| `GET /experiments/{id}/best?limit=N` | Top successful jobs by `valAccuracy` | `200` | `400`, `404` | implemented |
+| `GET /experiments?limit=N` | The newest experiments first, with progress | `200` | `400` | implemented |
 
 ### `POST /experiments`
 
@@ -213,13 +253,55 @@ default that could change later.
             {"field": "jobs[1].config.learningRate", "message": "must be less than or equal to 1.0"}]}
 ```
 
-**Idempotency-Key (M2).** This is the header's planned behavior:
+**Idempotency-Key** (optional header, 1–255 visible ASCII characters, otherwise `400`):
 
-- Same key with the same normalized request: `200` with the original experiment, and no new rows.
-- Same key with a different request: `409 IDEMPOTENCY_KEY_REUSED`.
-- Concurrent requests with the same key: exactly one experiment is created.
+| Situation | Response |
+|---|---|
+| First use of the key | `201`, and the key plus the request's fingerprint are stored with the experiment |
+| Same key, same request (by meaning) | `200` with the original experiment, including its current progress, and header `Idempotent-Replayed: true`. Nothing is created |
+| Same key, different request | `409 IDEMPOTENCY_KEY_REUSED` with `experimentId`. Nothing is created |
+| Concurrent requests with one key | Exactly one `201`; the rest are `200` or `409` as above (verified with 10 parallel curls) |
+
+**What "the same request" means.** Identity is the SHA-256 fingerprint of the *validated* request
+(`RequestFingerprint`), not of its bytes:
+
+- Key order, number spelling (`0.0001` / `1e-4` / `1.0E-4`), and an omitted default (`maxAttempts`)
+  do not change it, because the request is parsed into typed records first.
+- The canonical text is built from those records with explicitly sorted keys and plain-decimal
+  numbers, so it doesn't depend on serializer settings either. A golden test pins it: fingerprints
+  are stored, and a changed canonical form would make retries after a deploy conflict.
+- Job order *does* count, because it decides job indexes.
 
 The mechanism is described under [Transactions, locking, and time](#transactions-locking-and-time).
+
+### `GET /experiments/{id}/best`
+
+```json
+{"experimentId": 3, "metric": "valAccuracy", "jobs": [
+  {"rank": 1, "jobId": 89, "jobIndex": 76, "seed": 0, "config": {…}, "valAccuracy": 0.995,
+   "metrics": {"valAccuracy": 0.995, "valLoss": 0.022, "trainLoss": 0.02, "trainingSeconds": 0.11}}]}
+```
+
+- Only `SUCCEEDED` jobs are ranked, by `valAccuracy` descending.
+- Ties are broken by `jobIndex`, keeping one ranking metric while making the order deterministic.
+- `limit` is 1–100, default 10. A value outside that range returns `400 VALIDATION_FAILED` with
+  field `limit`.
+- An experiment has at most 500 jobs, so the sort reads them through the experiment's index and
+  needs no index of its own.
+
+### `GET /experiments`
+
+```json
+{"experiments": [{"id": 2, "name": "small-lr-width-sweep", "task": "synthetic-mlp-v1", "maxAttempts": 3,
+  "createdAt": "…", "progress": {"total": 6, "queued": 0, "running": 0, "succeeded": 6, "failed": 0}}]}
+```
+
+- It lists the newest experiments first, each exactly as `GET /experiments/{id}` shows it.
+- `limit` is 1–100, default 20. A value outside that range returns `400 VALIDATION_FAILED` with
+  field `limit`.
+- One statement reads every count, so they agree with each other, as for a single experiment.
+- `./sched` uses the first entry as "the latest experiment", so the CLI keeps no state of its
+  own.
 
 ### `GET /experiments/{id}/jobs` and `GET /jobs/{id}`
 
@@ -230,32 +312,114 @@ The mechanism is described under [Transactions, locking, and time](#transactions
               "epochs": 20, "optimizer": "adam", "weightDecay": 0.0},
    "state": "QUEUED", "attemptCount": 0, "maxAttempts": 3, "workerId": null,
    "valAccuracy": null, "result": null,
-   "createdAt": "2026-09-29T06:15:16.186697Z", "startedAt": null, "finishedAt": null}]}
+   "createdAt": "2026-09-29T06:15:16.186697Z", "startedAt": null, "finishedAt": null,
+   "leaseExpiresAt": null, "lastError": null}]}
 ```
+
+`lastError` is `{attemptNumber, type, message}` from the most recent unsuccessful attempt, or null.
+It stays after a later success, so the list shows at a glance which jobs needed retries and why.
+The query takes it with a `LEFT JOIN LATERAL` that reads each job's attempts newest first through
+the `(job_id, attempt_number)` index.
 
 The list is wrapped in an object so paging or filters can be added without breaking clients.
 Responses never include the attempt id: it is the worker's credential for changing the job.
 
-### Worker protocol (next increment: claim and complete)
+### Worker protocol: claim, heartbeat, complete (implemented)
 
-```
-POST /worker/jobs/claim            {"workerId": "worker-1"}   (1–64 chars of [A-Za-z0-9._-])
-→ 200 {"jobId": 17, "attemptId": "0b6f…", "attemptNumber": 1, "experimentId": 1,
-       "task": "synthetic-mlp-v1", "seed": 0, "config": {…}}
-       M2 adds "leaseExpiresAt", "leaseSeconds", "heartbeatIntervalSeconds".
-→ 204 No Content: nothing is queued. Poll again after a backoff.
+**Claim.** `POST /worker/jobs/claim` with `{"workerId": "worker-1"}`. The `workerId` is 1–64
+characters of `[A-Za-z0-9._-]`.
 
-POST /worker/jobs/17/complete
-     {"attemptId": "0b6f…", "metrics": {"valAccuracy": 0.9312, "valLoss": 0.2011,
-      "trainLoss": 0.1804, "trainingSeconds": 2.41, "epochsCompleted": 20}}
-→ 200 {"jobId": 17, "state": "SUCCEEDED"}
-→ 409 ATTEMPT_NOT_CURRENT: this attempt no longer owns the job. Stop and discard the result.
-      M2 adds 409 LEASE_EXPIRED, 409 RESULT_CONFLICT, and 200 with "replayed": true for an
-      identical retry.
+```json
+200 OK
+{"jobId": 1, "attemptId": "8b64bfc6-4e60-470c-94aa-234862d4287e", "attemptNumber": 1,
+ "experimentId": 1, "task": "synthetic-mlp-v1", "seed": 0,
+ "config": {"learningRate": 0.001, "hiddenUnits": 16, "hiddenLayers": 1, "batchSize": 64,
+            "epochs": 20, "optimizer": "adam", "weightDecay": 0.0},
+ "leaseExpiresAt": "2026-09-29T16:47:57.412Z", "leaseSeconds": 30.0, "heartbeatIntervalSeconds": 10.0}
 ```
 
-A `409` is a definitive rejection, and the worker must stop. Timeouts and `5xx` responses are
-transient, so the worker retries them with bounded backoff.
+- `204 No Content` means no queued job could be locked at that moment. The worker polls again
+  after a backoff.
+- A `204` can be momentarily pessimistic: if every remaining queued job is locked by a concurrent
+  claim, the claimer skips them all. Those claims will commit, so no work is lost.
+- **The lease starts at the claim.** The worker must heartbeat every `heartbeatIntervalSeconds`,
+  pacing by its own elapsed time.
+- `leaseExpiresAt` is database time and only informational: a worker never compares it with its own
+  clock.
+
+**Heartbeat.** `POST /worker/jobs/{jobId}/heartbeat` with `{"attemptId": "…"}`.
+
+- `200 {"jobId": 1, "leaseExpiresAt": "…"}`: the lease now ends `leaseSeconds` from the database's
+  `now()`.
+- `409 LEASE_EXPIRED`: the attempt still holds the running job, but its lease has passed. Leases are
+  strict, so an expired attempt cannot revive itself even before recovery runs.
+- `409 ATTEMPT_NOT_CURRENT`: the job was reassigned or finished, or this was never its attempt. A
+  stale attempt can therefore never renew the lease of the attempt that replaced it.
+- On either `409`, the worker must stop working on the job.
+
+**Complete.** `POST /worker/jobs/{jobId}/complete`:
+
+```json
+{"attemptId": "8b64bfc6-4e60-470c-94aa-234862d4287e",
+ "metrics": {"valAccuracy": 0.91, "valLoss": 0.25, "trainLoss": 0.2, "trainingSeconds": 1.5}}
+```
+
+| Metric | Rule |
+|---|---|
+| `valAccuracy` | 0.0–1.0. The fraction of the fixed validation split that the final model classifies correctly. This is the ranking metric |
+| `valLoss`, `trainLoss` | 0–1000000 |
+| `trainingSeconds` | 0–86400. Measured by the worker |
+
+The upper bounds also reject non-finite values. JSON has no NaN, but an overflowing literal such as
+`1e400` parses as infinity.
+
+- `200 {"jobId": 1, "state": "SUCCEEDED"}`: the result is accepted and final.
+- `409 LEASE_EXPIRED`: the lease passed before the report arrived. It is rejected even if recovery
+  has not run yet, and nothing changed.
+- `409 ATTEMPT_NOT_CURRENT`: the attempt does not own a running job, and nothing changed. The body
+  includes `jobState`, for example `RUNNING` when another attempt holds the job, or `SUCCEEDED`.
+- On either `409`, the worker must discard its result.
+- `404 NOT_FOUND`: no such job.
+- `400`: invalid report. Validation runs before any state is read.
+**Fail.** `POST /worker/jobs/{jobId}/fail`:
+
+```json
+{"attemptId": "8b64bfc6-…", "retryable": false, "errorType": "TRAINING_DIVERGED",
+ "message": "validation loss is nan"}
+```
+
+| Field | Rule |
+|---|---|
+| `attemptId` | required UUID |
+| `retryable` | required boolean. This is the worker's judgment; the budget has the last word |
+| `errorType` | required `UPPER_SNAKE_CASE` code, ≤ 64 characters |
+| `message` | required, ≤ 2000 characters (the worker truncates) |
+
+- The guard is the same as for completion: the job is `RUNNING`, the attempt is current, and its
+  lease is live.
+- `200 {"jobId": 2, "state": "QUEUED"}`: another attempt will run. That happens only when the
+  failure is retryable and attempts remain.
+- `200 {"jobId": 2, "state": "FAILED"}`: the job has ended.
+- `409 LEASE_EXPIRED` or `409 ATTEMPT_NOT_CURRENT`: nothing changed. A late failure report from an
+  expired attempt leaves no trace; recovery records that attempt as `EXPIRED`.
+
+**Attempt history.** `GET /jobs/{id}/attempts` returns
+`{"jobId": 1, "attempts": [{attemptNumber, workerId, status, claimedAt, lastHeartbeatAt, finishedAt,
+errorType, errorMessage, retryable}]}`, oldest first. It deliberately omits attempt ids: a running
+attempt's id is its worker's credential.
+
+**Repeated completions** (a retry after a lost response):
+
+| The repeated report comes from… | Response |
+|---|---|
+| the attempt whose result was accepted, with the identical result | `200 {"state": "SUCCEEDED", "replayed": true}`. Nothing changes, not even `finished_at` |
+| the attempt whose result was accepted, with a different result | `409 RESULT_CONFLICT`. The accepted result stands |
+| a stale attempt, even with an identical payload | `409 ATTEMPT_NOT_CURRENT`. It was never this attempt's result to repeat |
+| the right attempt, but its first report arrives after the lease expired | `409 LEASE_EXPIRED`. Never a replay, because nothing was accepted |
+
+A `409` is a definitive rejection, so the worker must stop. Timeouts and `5xx` responses are
+transient, so the worker retries them with bounded backoff. A retried report whose first delivery
+got through is acknowledged as a replay, and the worker logs "acknowledged on retry".
 
 ### Error codes
 
@@ -267,8 +431,10 @@ transient, so the worker retries them with bounded backoff.
 | `NOT_FOUND` | 404 | Unknown experiment, job, or route |
 | `METHOD_NOT_ALLOWED`, `UNSUPPORTED_MEDIA_TYPE`, … | 405, 415, … | Spring MVC errors; the code is derived from the status |
 | `INTERNAL_ERROR` | 500 | Unexpected; details go to the log, not the client |
-| `ATTEMPT_NOT_CURRENT` | 409 | (next) The attempt no longer owns the job |
-| `LEASE_EXPIRED`, `RESULT_CONFLICT`, `IDEMPOTENCY_KEY_REUSED` | 409 | (M2) |
+| `ATTEMPT_NOT_CURRENT` | 409 | The attempt does not own a running job; `jobId` and `jobState` are included |
+| `LEASE_EXPIRED` | 409 | The attempt holds the running job, but its lease has passed (strict leases) |
+| `RESULT_CONFLICT` | 409 | The attempt's accepted result differs from the one just reported |
+| `IDEMPOTENCY_KEY_REUSED` | 409 | The key belongs to a different request; `experimentId` names its experiment |
 
 ## Guarantees
 
@@ -280,27 +446,29 @@ transient, so the worker retries them with bounded backoff.
 | G2 | Malformed or out-of-range input is rejected before anything is stored | Strict Jackson settings plus Bean Validation | implemented, tested |
 | G3 | Stored jobs never violate lifecycle invariants | CHECK constraints | implemented, tested |
 | G4 | Progress counts always agree with each other | One aggregate statement, which reads one snapshot | implemented, tested |
-| G5 | Two workers never both claim the same queued job | Single-statement claim with `FOR UPDATE SKIP LOCKED` | next increment |
-| G6 | Only the current attempt can complete a job, and a succeeded job is never overwritten | Guarded `UPDATE` plus the affected-row count | next increment |
+| G5 | Two workers never both claim the same queued job | Single-statement claim with `FOR UPDATE SKIP LOCKED` | implemented, tested |
+| G6 | Only the current attempt can complete a job, and a succeeded job is never overwritten | Guarded `UPDATE` plus the affected-row count | implemented, tested |
 
-**The MVP does not guarantee the following** (known limitations, fixed in M2):
+**The MVP alone did not guarantee the following.** Leases (2.1) fixed the first; the rest remain:
 
-- A worker that crashes, or a claim response lost in transit, leaves its job `RUNNING` forever.
-- Failures cannot be reported, and there are no retries. `maxAttempts` is stored but unused.
-- Submitting the same batch twice creates two experiments.
-- A completion retried after a lost response gets `409`, even though its result was stored.
+- ~~A worker that crashes, or a claim response lost in transit, leaves its job `RUNNING`
+  forever.~~ Fixed by R1.
+- ~~Failures cannot be reported.~~ Fixed in 2.2 (`/fail`; R4).
+- ~~Submitting the same batch twice creates two experiments.~~ Fixed in 2.3 (R5), when the client sends an `Idempotency-Key`.
+- ~~A completion retried after a lost response gets `409`.~~ Fixed in 2.3 (R6).
 
-### Reliability milestone (planned)
+### Reliability milestone
 
-| # | Guarantee | Mechanism |
-|---|---|---|
-| R1 | A crashed worker's job becomes eligible again | Lease in database time, renewed by heartbeats. A sweeper re-queues expired attempts |
-| R2 | Recovery is safe with several API instances | The sweeper uses `SKIP LOCKED`, and its guards are re-evaluated under the row lock. No leader election |
-| R3 | A stale attempt cannot renew, complete, or fail a job | Guards on `current_attempt_id`, `state`, and `lease_expires_at > now()`. Strict leases: an expired attempt loses authority even before the sweeper runs |
-| R4 | Retries stop at `maxAttempts`, including lease expiry | The guard plus `jobs_attempt_count_within_budget` |
-| R5 | Submissions are idempotent | Unique key, fingerprint, and one transaction |
-| R6 | Repeating a completion is safe | Identical replay → `200`, no mutation. Different payload → `409` |
-| R7 | At most one accepted success per job | The terminal-state guard plus a partial unique index on `attempts` |
+| # | Guarantee | Mechanism | Status |
+|---|---|---|---|
+| R1 | A crashed worker's job becomes eligible again | A lease in database time, renewed by heartbeats. A periodic sweep re-queues expired attempts | implemented; tested, and verified live with SIGKILL and `docker pause` |
+| R2 | Recovery is safe with several API instances | The sweep locks rows with `SKIP LOCKED` and re-checks expiry under the lock. No leader election | implemented; 8 concurrent sweeps recover each attempt exactly once |
+| R3 | A stale attempt cannot renew or complete a job, or replace a newer attempt's lease | Guards on `current_attempt_id`, `state`, and `lease_expires_at > now()`. Leases are strict: an expired attempt loses authority even before the sweep runs | implemented, tested, including `fail` |
+| R4 | Retries stop at `maxAttempts`, however attempts end | The fail guard re-queues only when `retryable AND attempt_count < max_attempts`, and the sweep fails a job whose final attempt expired. `jobs_queued_has_attempts_left` backs both: a mutation that ignored the budget was stopped by this CHECK | implemented; tested through failures alone and through a mix of expiries and failures |
+| R5 | Submissions with an `Idempotency-Key` are idempotent | Unique key, `INSERT … ON CONFLICT DO NOTHING` in the creating transaction, and a fingerprint comparison | implemented; tested sequentially, by meaning, and with 8 concurrent submissions of one or two bodies; verified live with 10 parallel curls |
+| R6 | Repeating a completion is safe | An identical repeat from the accepted attempt → `200` replay, no mutation. A different payload → `409 RESULT_CONFLICT`. Stale or late → the usual rejection | implemented; tested, including 8 simultaneous identical deliveries (1 accepted, 7 replayed) |
+| R7 | At most one accepted success per job | The terminal-state guard plus `attempts_one_success_per_job` | implemented, tested |
+| R8 | A completion racing lease-expiry recovery: exactly one wins | Both sides lock the same row; the loser's guard fails on re-check (or `SKIP LOCKED` passes over it) | implemented; both orders forced deterministically in tests |
 
 **Delivery semantics.** Execution is at-least-once. A job can run more than once, for example
 after a crash, or when a slow worker that is still alive loses its lease. The service accepts at
@@ -321,7 +489,7 @@ most one terminal result per job. This is not exactly-once execution.
   clocks are never compared with the server's. `now()` is the transaction's start time, and these
   transactions are single statements that last milliseconds.
 
-Planned claim statement (next increment):
+**The claim statement** (`JobRepository.claimNext`):
 
 ```sql
 WITH next_job AS (
@@ -333,66 +501,465 @@ WITH next_job AS (
 )
 UPDATE jobs j
 SET state = 'RUNNING', attempt_count = j.attempt_count + 1,
-    current_attempt_id = gen_random_uuid(), worker_id = :workerId, started_at = now()
-    -- M2 also sets lease_expires_at = now() + lease and inserts the attempts row in this transaction
-FROM next_job
-WHERE j.id = next_job.id
-RETURNING j.id, j.current_attempt_id, j.attempt_count, j.experiment_id, j.seed, j.config;
+    current_attempt_id = gen_random_uuid(), worker_id = :workerId, started_at = now(),
+    lease_expires_at = now() + make_interval(secs => :leaseSeconds)
+FROM next_job, experiments e         -- experiments only supplies the task; its rows are not locked
+WHERE j.id = next_job.id AND e.id = j.experiment_id
+RETURNING j.id, j.current_attempt_id, j.attempt_count, j.experiment_id, e.task, j.seed, j.config,
+          j.lease_expires_at;
 ```
 
-Planned completion guard (next increment):
+The same transaction then inserts the `attempts` row. The job row and its attempt become visible
+together, when the transaction commits.
+
+Its plan, measured on 506 jobs, is
+`Limit → LockRows → Index Scan using jobs_queued_idx (Filter: state = 'QUEUED')`, followed by
+primary-key joins:
+
+1. The partial index yields queued jobs in id order.
+2. `LockRows` locks each candidate and skips any that another claim holds.
+3. `Limit` stops at the first row it locks.
+
+The `Filter` re-checks `state`, because an index entry can point to a row version that has since
+stopped being queued.
+
+**Why the lock clause is what makes claims correct.** A mutation test removed
+`FOR UPDATE SKIP LOCKED`, and the concurrency tests failed.
+
+- Without the lock, concurrent claims all picked the same oldest job from their snapshots. Each
+  loser then blocked on the winner's row lock.
+- When PostgreSQL re-checked the loser's `WHERE` clause (`j.id = next_job.id …`), it still matched,
+  because it never mentions `state`. So the loser claimed the job again, as attempt 2, then 3.
+- Those double assignments were silent. Errors appeared only once four or more claimers piled onto
+  one job and `attempt_count` exceeded `max_attempts` in the CHECK constraint.
+- So the constraint is a backstop, and the row lock is the mechanism.
+- A second mutation removed only `SKIP LOCKED`, keeping `FOR UPDATE`, and the concurrency tests
+  still passed. A claimer that meets a locked row waits for the holder to commit, and PostgreSQL
+  then re-checks `state = 'QUEUED'` on the updated row and moves on to the next one.
+- `SKIP LOCKED` therefore buys throughput, because claimers never wait on each other. It does not
+  buy correctness. Throughput itself has not been measured yet.
+
+**The completion guard** (`JobRepository.markSucceeded`). One updated row means accepted:
 
 ```sql
 UPDATE jobs
-SET state = 'SUCCEEDED', val_accuracy = :valAccuracy, result = CAST(:metrics AS jsonb), finished_at = now()
+SET state = 'SUCCEEDED', val_accuracy = :valAccuracy, result = CAST(:result AS jsonb),
+    finished_at = now(), lease_expires_at = NULL
 WHERE id = :jobId AND state = 'RUNNING' AND current_attempt_id = :attemptId
-  -- M2: AND lease_expires_at > now()
+  AND lease_expires_at > now()
 ```
 
-**A lost claim response.** The claim committed, but the worker never learned the attempt id. In the
-MVP, the job stays `RUNNING` forever. In M2, nobody heartbeats that attempt, so its lease expires
-and the sweeper re-queues the job. That costs one lease duration and one attempt from the budget.
-The job never runs twice because of this, since nobody executes the lost attempt.
+The same transaction marks the attempt `SUCCEEDED`.
 
-**Leases (M2).** The planned defaults, all configurable:
+Duplicate deliveries of one attempt's report race on this row. The first `UPDATE` to lock it wins.
+Each of the others waits, then its re-checked `state = 'RUNNING'` fails, so it updates 0 rows. The
+concurrency test fires 8 simultaneous deliveries: exactly one is accepted, and the stored result is
+that one's.
 
-- The lease lasts 30 s, and the worker heartbeats every 10 s, so two heartbeats can be missed.
-- The sweeper runs every 5 s, so an expired attempt is re-queued at most about 35 s after its last
-  successful heartbeat.
-- The claim response carries the lease and heartbeat settings, so workers follow server policy.
-- When the final allowed attempt expires, the job becomes `FAILED` with a "lease expired on final
-  attempt" error.
+The heartbeat (`JobRepository.renewLease`) uses the same guard and sets
+`lease_expires_at = now() + lease`.
 
-**Idempotent submission (M2).**
+**The failure guard** (`JobRepository.markFailed`) checks authority and decides the outcome in one
+statement:
+
+```sql
+UPDATE jobs
+SET state              = CASE WHEN :retry AND attempt_count < max_attempts THEN 'QUEUED' ELSE 'FAILED' END,
+    current_attempt_id = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE current_attempt_id END,
+    …                  -- worker_id, started_at, finished_at likewise
+    lease_expires_at   = NULL
+WHERE id = :jobId AND state = 'RUNNING' AND current_attempt_id = :attemptId AND lease_expires_at > now()
+RETURNING state, attempt_count, max_attempts
+```
+
+- The budget is read under the same row lock that authorizes the write, so no separate read can go
+  stale.
+- PostgreSQL evaluates every `SET` expression against the *old* row. Each `CASE` therefore sees the
+  same `attempt_count`, whatever order the assignments are written in. (MySQL, by contrast,
+  applies single-table assignments left to right.)
+- The same transaction marks the attempt `FAILED`, with `error_type`, `error_message`, and
+  `retryable`.
+
+**Leases.** These are the defaults. They are set in `SchedulerProperties` and overridable with
+environment variables. Spring maps a variable to a property by replacing `_` with `.` and ignoring
+dashes, so `SCHEDULER_LEASE_HEARTBEATINTERVAL=3s` sets `scheduler.lease.heartbeat-interval`.
+
+- `RecoverySweeper` schedules itself from the same bound properties (a `SchedulingConfigurer`),
+  rather than a `@Scheduled` placeholder that would resolve environment variables by other rules.
+- One binding path governs the whole policy.
+- At startup the API logs the effective policy, e.g. `Recovering expired leases every 1.0 s …
+  (leases last 10.0 s, heartbeats every 3.0 s)`. The demo checks that line.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `scheduler.lease.duration` | 30 s | |
+| `scheduler.lease.heartbeat-interval` | 10 s | Must be at most half the duration; startup fails otherwise. Two consecutive heartbeats can be missed |
+| `scheduler.recovery.sweep-interval` | 5 s | |
+| `scheduler.recovery.batch-size` | 100 | Jobs per recovery transaction |
+
+- An attempt that stops heartbeating is re-queued within about lease + sweep interval (≤ 35 s)
+  after the moment its lease was last set.
+- Measured live: a worker was SIGKILLed about 3.5 s after claiming a job, before its first
+  heartbeat. The job was re-queued 30 s after the kill and reclaimed a second later.
+- Workers receive the lease settings in the claim response, so server policy is the only source.
+
+**Recovery** (`RecoveryService.recoverExpiredLeases`). Each batch is one transaction of four
+statements:
+
+1. `SELECT … WHERE state = 'RUNNING' AND lease_expires_at <= now() ORDER BY lease_expires_at LIMIT n
+   FOR UPDATE SKIP LOCKED` locks the expired rows. Rows that a completion, a heartbeat, or another
+   sweep holds are skipped. A row that changed after the snapshot is re-checked against the new
+   version, so a lease renewed a moment ago no longer matches.
+2. `UPDATE … SET state = 'QUEUED', current_attempt_id = NULL, … WHERE id IN (…) AND
+   attempt_count < max_attempts` returns jobs with attempts left to the queue.
+3. `UPDATE … SET state = 'FAILED', finished_at = now() WHERE id IN (…) AND attempt_count >=
+   max_attempts` fails jobs whose final attempt expired. They keep that attempt's identity.
+4. `UPDATE attempts SET status = 'EXPIRED', error_type = 'LEASE_EXPIRED' …` closes the expired
+   attempts.
+
+The service then checks that steps 2 and 3 changed every locked row, and that step 4 changed
+exactly one attempt per job. If either check fails, jobs and attempts have diverged, and the
+exception rolls back all four writes.
+
+- **Why lock first and update second** (unlike the one-statement claim): the sweep needs the old
+  attempt id, which step 2 erases, and it must split the rows into re-queued and failed. Holding
+  the locks from step 1 until commit means nothing can change the rows in between.
+- **Why a periodic sweep, not recovery during claims.** A job whose final attempt expired must
+  become `FAILED` promptly even if nobody claims anything. The sweep keeps progress counts honest.
+  It is the only recovery mechanism.
+- **Three independent defenses stop a stale overwrite.** The completion guard checks the attempt,
+  state, and lease. Beyond it, the `attempts` row-count check refuses to mark a non-`RUNNING`
+  attempt `SUCCEEDED`.
+  - Shown by running the demo against an API whose completion guard had no attempt check. The
+    stale report *passed* the broken guard, then hit `IllegalStateException: Expected 1 running
+    attempt row(s) … but updated 0`.
+  - The transaction rolled back, so the job kept attempt 2's result. The demo still failed that
+    run, because a `500` is not the correct answer.
+- **Every API instance may sweep.** Mutation-tested: removing the lock clause makes concurrent
+  sweeps collide.
+
+**Completion versus recovery.** The boundary case:
+
+- A completion's transaction starts at t₁, just before the lease ends at L. Recovery's transaction
+  starts at t₂, just after (t₁ < L < t₂).
+- `now()` is fixed per transaction. The completion sees a live lease and recovery sees an expired
+  one, so both guards pass, each by its own clock. Only the row lock decides.
+- **If recovery locks first:** the completion's `UPDATE` waits. When recovery commits, the
+  completion re-checks against the re-queued row, updates 0 rows, and is rejected with
+  `ATTEMPT_NOT_CURRENT`.
+- **If the completion locks first:** recovery's `SKIP LOCKED` passes over the row, and the result
+  stands. The next sweep sees `SUCCEEDED` and ignores it.
+- `ReportRecoveryRaceTests` forces both orders deterministically, for both kinds of report
+  (completion and non-retryable failure), since they use the same guard. Each side runs in a held
+  transaction, the lease is placed between the two start times, and the test waits for
+  PostgreSQL's `pg_stat_activity` to report the lock wait.
+- Consequence: an attempt's authority is judged at its transaction's start, so a completion can
+  still win by the few milliseconds its statement takes. Strictness is bounded by statement
+  duration. Safety comes from the row lock, not from the clock.
+
+**A lost claim response.** The claim committed, but the worker never learned the attempt id.
+Nobody heartbeats that attempt, so its lease expires and the sweep re-queues the job. That costs
+one lease duration and one attempt from the budget. The job does not run twice because of this,
+since nobody executes the lost attempt.
+
+**Idempotent submission** (`ExperimentService.submit`). One transaction does all of this:
 
 1. `INSERT INTO experiments (…, idempotency_key, request_fingerprint) VALUES (…) ON CONFLICT
-   (idempotency_key) DO NOTHING RETURNING id` runs inside the submission transaction.
-2. A concurrent insert with the same key blocks on the unique index until the first transaction
-   finishes, and then inserts nothing.
-3. In that case, a follow-up `SELECT` sees the committed row, because READ COMMITTED takes a new
-   snapshot per statement, and compares fingerprints.
-4. The fingerprint is a SHA-256 over a canonical serialization of the validated request, with
-   defaults applied, keys sorted, and numbers formatted from parsed values.
+   (idempotency_key) DO NOTHING RETURNING id`.
+2. If a row came back, insert the jobs. Created.
+3. Otherwise the key was taken. `SELECT id, request_fingerprint … WHERE idempotency_key = :key`,
+   then compare fingerprints: equal is a replay, different is `IDEMPOTENCY_KEY_REUSED`.
+
+**Why concurrent duplicates can't both create.**
+
+- While transaction A has inserted the key but not committed, B's `INSERT … ON CONFLICT` *waits*
+  for A.
+- If A commits, B inserts nothing. B's follow-up `SELECT` is a new statement with a new snapshot
+  under READ COMMITTED, so it sees A's row, and A's jobs, which committed with it.
+- If A rolled back, B's insert proceeds.
+- This relies on READ COMMITTED. Under REPEATABLE READ, B's snapshot would predate A's commit, and
+  PostgreSQL would raise a serialization error instead.
+- Mutation-tested: without `ON CONFLICT`, a duplicate key is a unique-constraint violation, and
+  even a sequential retry fails with a 500.
+- Side effect: every losing insert still draws an id from the sequence (sequences never roll
+  back), so experiment ids have gaps.
+
+**Classifying a rejected completion.** The guarded `UPDATE` decides first, and a replay is
+recognized only after it has refused to write:
+
+- The service reads the job. If it is `SUCCEEDED` under the same attempt, it compares the stored
+  result with the new one as JSONB (`result = CAST(:result AS jsonb)`, equal by meaning, not by
+  text).
+- This read can't race anything: a `SUCCEEDED` job's attempt and result never change.
+- It only chooses the response. Nothing is written either way.
 
 **Multiple API instances.** Claims (`SKIP LOCKED`), sweeps (`SKIP LOCKED` plus re-checked guards),
 and Flyway migrations (which take an advisory lock) are all safe to run concurrently.
 
-**Worker execution (planned).**
+## Worker (implemented, `worker/`)
 
-- Training runs in the worker's main thread. A heartbeat thread renews the lease, and a lost lease
-  sets a stop flag that the training loop checks after every minibatch.
-- A training subprocess could be killed even while stuck inside native code. The cost is a
-  PyTorch import (about 1–2 s) per job, which would distort throughput measurements of small jobs.
-  Cooperative stopping is enough because we own the training loop.
-- `torch.set_num_threads(1)` and `OMP_NUM_THREADS=1` stop N workers from quietly using N × cores
-  threads.
+A Python process that loops: claim a job, train it, report the result. It runs one job at a time
+and talks only to the API.
+
+| Module | Role |
+|---|---|
+| `config.py` | Parses and re-validates the assignment and config, with the same bounds as the API, and reads settings from the environment |
+| `task.py` | Task `synthetic-mlp-v1`: the dataset, model, training, and metrics |
+| `client.py` | HTTP calls with timeouts, plus the retry rules below |
+| `worker.py` | The loop, idle backoff, and two-stage shutdown |
+| `backoff.py` | Exponential backoff with jitter |
+
+### Task `synthetic-mlp-v1`
+
+- **Dataset.** Three interleaved spiral arms in 2-D, 1000 points per class, with angle noise
+  σ = 0.2.
+  - It is generated from the fixed seed `20260929` and split 2000 train / 1000 validation.
+  - Every job sees exactly the same data. Changing any of these constants means a new task id.
+- **Model.** An MLP: `hiddenLayers` × (`Linear(hiddenUnits)` + ReLU), then `Linear(3)`. It is trained
+  with cross-entropy using SGD or Adam, with `learningRate` and `weightDecay`.
+- **Seeds.** The job's `seed` drives weight initialization, via `torch.manual_seed`, and minibatch
+  order, via its own `torch.Generator`. The dataset has a separate generator, so the two never
+  interact.
+- **Metrics.**
+  - `valAccuracy`: accuracy of the final model on the validation split. This is the ranking
+    metric.
+  - `valLoss` and `trainLoss`: mean cross-entropy of the final model on each split.
+  - `trainingSeconds`: wall-clock time of the training epochs only.
+  - A non-finite loss raises `TrainingDiverged`.
+- **Cost.**
+  - The example configs train in about 0.1–0.2 s each in a 1-CPU container.
+  - A `256x4`, batch-8, 100-epoch config takes about 17 s. That is the "long job" used for
+    shutdown and crash demonstrations.
+  - The spread in accuracy is real. On the example batch it runs from 0.57 (a tiny model with a low
+    learning rate) to 0.98.
+
+### Reproducibility
+
+Training runs on one CPU thread with `torch.use_deterministic_algorithms(True)`.
+
+- **Verified.** Nine jobs with the same config and seed, trained by three different worker
+  containers, produced one identical `(valAccuracy, valLoss, trainLoss)` tuple, bit for bit. Only
+  `trainingSeconds` varied (0.44–0.51 s).
+- **Limits.** The guarantee holds only for the same PyTorch build on the same CPU architecture. The
+  macOS arm64 wheel and the Linux aarch64 `+cpu` build gave 0.980 and 0.981 for one example config,
+  and matched on the other five. Wall-clock time is never reproducible.
+
+### CPU threads
+
+- `OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1` are set in the image, before Python starts.
+- The worker also calls `torch.set_num_threads(TORCH_NUM_THREADS)` (default 1) and
+  `torch.set_num_interop_threads(1)`.
+- Each worker container is limited to `cpus: 1.0`.
+- Together these mean that N workers use about N cores, instead of N × all-cores threads competing
+  with each other. Benchmarks will depend on this.
+
+### Polling and HTTP
+
+| Situation | Behavior |
+|---|---|
+| `204` (nothing queued) or a failed claim | Wait with backoff, then claim again. Waits double from 0.5 s up to 5 s, each drawn uniformly from [ceiling/2, ceiling] so workers don't poll in lockstep. The backoff resets after a job |
+| Timeouts | 3 s to connect and 10 s to read, on every request |
+| Claim fails (connection error, timeout, `5xx`) | **Not retried** immediately. A claim is not idempotent: if it committed and only the response was lost, retrying would claim a second job while the first stays `RUNNING` under an attempt nobody holds. The worker just polls again later |
+| Completion fails (connection error, timeout, `5xx`) | Retried, up to 5 attempts with jittered backoff from 0.5 s to 8 s. This is safe because the API's guard accepts at most one result per job, and only from the running attempt, so a duplicate can never overwrite anything |
+| `409` on completion | Definitive. The result is discarded and the loop continues. An earlier delivery that got through now comes back as `200` with `replayed: true` instead |
+| Heartbeat fails transiently | Sent once. The heartbeat thread tries again at its next interval; two misses in a row still leave the lease alive |
+| Failure report fails transiently | Retried like a completion (5 attempts), and safe for the same reason. If it never gets through, the lease expires and recovery records the attempt `EXPIRED` |
+| `409` on heartbeat | Definitive: the lease is lost. Training stops at the next minibatch and nothing is reported |
+| Other `4xx` | A bug or version skew. Logged and never retried |
+
+### Heartbeats (`heartbeat.py`)
+
+- **A background thread** sends `POST …/heartbeat` every `heartbeatIntervalSeconds`, using the value
+  from the claim response. It runs for the whole of training *and* reporting: the lease has to stay
+  alive until the result is acknowledged.
+- **`lost` is set, and training stops at the next minibatch,** in either of two cases:
+  - **The API answers `409`.** The lease expired or the job was reassigned. This is the definitive
+    signal, and the server's decision.
+  - **No renewal has succeeded for a full lease duration.** This is self-fencing during an API
+    outage. The last success was received after the server set that lease's expiry, so once
+    `lease_seconds` of local monotonic time have passed since that receipt, the lease has expired
+    by the server's clock too. Timing from the request's send time would get this wrong, because
+    the server may have renewed later than the send.
+  - The self-fencing check only saves wasted training. The server would reject the result anyway.
+    It uses elapsed time on one machine and never compares clocks.
+- **Verified live with `docker pause`,** and scripted, with checks, as the `stale` scenario of
+  `scripts/demo.sh`:
+  1. A worker was frozen mid-training for longer than its lease.
+  2. Recovery re-queued the job, and the other worker claimed attempt 2.
+  3. On unpause, the frozen worker's next heartbeat got `409 ATTEMPT_NOT_CURRENT`. It stopped
+     training and reported nothing, and attempt 2's lease was untouched.
+  4. Attempt 2's result was accepted.
+
+### Execution and shutdown
+
+- **Training thread.** Training runs in the main thread. `train()` calls `should_stop()` before
+  every minibatch, so a stop takes effect within milliseconds. `should_stop()` is true after a
+  second stop signal, or once the heartbeat has lost the lease.
+- **Why not a training subprocess.** A subprocess could be killed even while stuck inside native
+  code. But each job would pay about 1–2 s of PyTorch import, which dwarfs the 0.1 s jobs and would
+  distort throughput measurements. Cooperative stopping is enough because we own the training loop.
+- **First SIGTERM or SIGINT.** The worker stops claiming. An idle worker exits within 0.2 s, because
+  waits are sliced. A busy worker finishes and reports its job first; Compose waits up to
+  `stop_grace_period: 60s` before sending SIGKILL.
+  - Verified: `docker compose stop worker` with three workers. Two idle workers exited at once. The
+    busy one finished its about-17 s job, reported `SUCCEEDED`, and exited with code 0.
+- **Second signal.** The current run is aborted at the next minibatch and not reported.
+  - Verified live in 1.3: the worker exited 2 s after the first signal, with code 0.
+  - Since 2.1, the abandoned attempt's lease expires and recovery retries the job (verified live
+    with SIGKILL, which is the harsher version of this).
+- **The signal handler only sets flags** and writes to fd 2 with `os.write`. Logging and
+  `threading.Event` take locks, and taking a lock inside a handler can deadlock with the code the
+  signal interrupted.
+- **Why the handler is necessary.** As PID 1 in a container, a process without a SIGTERM handler
+  ignores `docker stop` until SIGKILL.
+- **Survives an API outage.** Verified: with the API stopped for about 8 s, claims failed at growing
+  intervals. When the API came back, the worker resumed and finished a 6-job batch.
+
+**How the worker classifies each outcome** (`worker.py`):
+
+| Outcome | Report | Why |
+|---|---|---|
+| Training finished and the lease is intact | `complete` | |
+| `TrainingDiverged` (a non-finite loss) | `fail`, `TRAINING_DIVERGED`, not retryable | Deterministic for this config and seed: another attempt would diverge the same way. No in-bounds config diverges in practice; this is a safety net |
+| The assignment can't be run (unknown task, invalid config) | `fail`, `INVALID_ASSIGNMENT`, not retryable | Every worker of this version would reject it. If even the job and attempt ids are unusable, nothing can be reported, and the lease expires |
+| Any other exception during training | `fail`, `WORKER_ERROR`, retryable | Unknown cause, so it is retried within the budget. The worker itself keeps running |
+| Aborted by a second stop signal | `fail`, `WORKER_SHUTDOWN`, retryable | Not the job's fault. Reporting hands the job over at once instead of after the lease: verified live, re-queued within 1 s and reclaimed at 4 s |
+| Lease lost (`409`, or self-fenced) | nothing | The attempt no longer has authority to report anything |
+
+A shutdown still consumes an attempt from the budget, like any other execution that started.
+Giving it back would mean reusing an attempt number, which `attempts_job_attempt_number_unique`
+forbids.
+
+## Logs
+
+In the Compose stack both services log one JSON object per line: the API through
+`LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`, and the workers through `LOG_FORMAT=json`. Run anywhere
+else (an IDE, the tests, `uv run`), they log text.
+
+**The shape** is Spring Boot's Elastic Common Schema (ECS) format, which the worker reproduces with
+a small stdlib formatter (`worker/scheduler_worker/logs.py`):
+
+- `@timestamp` (UTC), `log.level` (with Logback's names: `WARN`, not `WARNING`), `log.logger`,
+  `process.pid`, `process.thread.name`, `service.name` (`scheduler-api` or `scheduler-worker`),
+  `message`, and `ecs.version`;
+- `error.type`, `error.message`, and `error.stack_trace` when an exception is logged;
+- each event's own fields at the top level, with the same names on both sides.
+
+| Field | Meaning |
+|---|---|
+| `event.action` | A stable name for what happened (below). Messages are for people and may change; queries and `scripts/demo.sh` use this |
+| `experimentId`, `jobId`, `attemptNumber`, `attemptId`, `workerId` | The ids, typed as in the API's JSON: numbers, and strings for attempt and worker ids |
+| `code`, `jobState` | On a rejection: the same values as the `409` response's |
+| Others | Specific to the event: `errorType`, `retryable`, `valAccuracy`, `maxAttempts`, `leaseSeconds`, … |
+
+**Events.** Where both sides log one, they describe the same fact, and `service.name` says whose
+view it is.
+
+| `event.action` | Logged by | Other fields, or what it means |
+|---|---|---|
+| `experiment.created` | API | `jobCount`, `maxAttempts`, `idempotencyKey` (only if one was sent) |
+| `submission.replayed`, `submission.key_reused` | API | `idempotencyKey` |
+| `job.claimed` | API | the attempt's ids and `workerId` |
+| `training.started` | worker | `seed` |
+| `heartbeat.rejected` | API | `code`, `jobState` |
+| `heartbeat.failed` | worker | a transient failure; the thread tries again |
+| `lease.lost` | worker | `reason`: a rejected renewal, or a full lease without one |
+| `lease.expired` | API | `workerId`, `jobState` (`QUEUED` or `FAILED`), `maxAttempts` |
+| `result.accepted` | both | `valAccuracy`; the worker adds `valLoss`, `trainingSeconds`, `replayed` |
+| `result.replayed` | API | an identical repeat of the accepted report |
+| `result.rejected`, `failure.rejected` | both | `code`, `jobState` |
+| `result.undeliverable`, `failure.undeliverable` | worker | the report failed after its retries |
+| `failure.recorded` | both | `errorType`, `retryable`, `jobState`; the API adds `maxAttempts` |
+| `recovery.policy` | API | `sweepIntervalSeconds`, `batchSize`, `leaseSeconds`, `heartbeatIntervalSeconds` |
+| `request.failed` | API | an unhandled exception, with `error.*` |
+| `worker.configured`, `worker.started`, `worker.stopped`, `claim.failed`, `request.retrying`, `training.error`, `assignment.unusable` | worker | the worker's own lifecycle and troubles |
+
+- **Each event carries the ids its code path already has.** Logging never costs a query. The
+  API's report events have `attemptId` but not `attemptNumber`. Its `job.claimed` event maps one to
+  the other, which is how the demo's timeline labels attempts.
+- **Events are logged inside the transaction that makes the change.** If the commit then failed,
+  the line would describe a change that was rolled back, and the error would follow it.
+  - At the benchmark's rates, the two per-job INFO events cost about a third of dispatch
+    throughput, mostly as waiting rather than CPU (`docs/BENCHMARKS.md`, Experiments).
+  - Logging after commit would address both points.
+- **Timestamps differ in precision.** The API prints up to 9 fractional digits and the worker 6,
+  so pad the fractions before sorting the strings.
+- **Attempt ids appear in logs,** which only operators read, and never in read endpoints.
+- **Tested three ways:**
+  - `StructuredLogTests` renders real events through Boot's ECS encoder;
+  - `test_logs.py` checks the worker's lines;
+  - `scripts/demo.sh` reads four events and fails when they are missing. With the workers switched
+    back to text logs, the `stale` scenario failed both of its worker-log checks.
+
+Reading them:
+
+```bash
+# The messages alone
+docker compose logs --no-log-prefix worker | jq -R -r 'fromjson? | .message'
+# One job's story across the API and every worker
+docker compose logs --no-log-prefix api worker | jq -R -r 'fromjson? | select(.jobId == 1)
+  | [."@timestamp", .service.name, .event.action, .message] | @tsv' | sort
+```
+
+`fromjson?` skips any line that isn't JSON, such as a stop signal's notice on a worker's stderr.
+
+## Continuous integration (`.github/workflows/ci.yml`)
+
+Every push starts three independent jobs, each on a fresh GitHub-hosted `ubuntu-24.04` x86_64 runner.
+They run the local development commands, made stricter where CI must fail on drift (`uv sync
+--locked`, then `uv run --no-sync pytest`, instead of `uv run pytest`). A green run therefore means
+those commands work from a clean checkout. Each push tests its tip commit. `workflow_dispatch` also allows a run on
+demand, from the Actions tab once the workflow is on `main`.
+
+| Job | Runs | Shows |
+|---|---|---|
+| `api` | `./mvnw -B -ntp verify` on Temurin 21.0.12.1+1 | Every API test passes against PostgreSQL 18.6 in Testcontainers, on the JDK build the API image runs |
+| `worker` | `uv sync --locked`, then `uv run --no-sync pytest`, with uv 0.12.20, CPython 3.14.7, and one OpenMP thread | The worker tests pass with x86_64 torch, and `uv.lock` matches `pyproject.toml` |
+| `e2e` | `docker compose … build`, then `scripts/demo.sh` | Both images build from a clean checkout, and all 17 demo checks pass: the sweep, crash recovery, and stale-worker fencing |
+
+- **Pinned like everything else:**
+  - Each action is pinned to a full commit SHA, with its release in a comment.
+  - The runner label is `ubuntu-24.04`, not `ubuntu-latest`.
+  - setup-java names the image's JDK build in Adoptium's SemVer, `21.0.12+101.0.LTS`. A step then
+    checks `$JAVA_HOME/release` for `21.0.12.1+1`. Shorter spellings either float, or match the
+    JDK preinstalled on the runner.
+  - `verify-signature: true` makes setup-java fail, instead of warn, when the JDK's GPG signature
+    does not verify. The download's sha256 comes from the same Adoptium API as its URL.
+  - setup-uv is given the uv release's checksum, because this release of the action predates uv
+    0.12.20.
+  - The runner image brings its own Docker and Compose, which the workflow does not pin. The
+    ubuntu-24.04 image's published software list gives 28.0.4 and 2.38.2; neither has been
+    observed on a run yet.
+- **Least privilege:** `permissions: contents: read`, and checkout does not persist its token. No
+  repository secrets are used. The only credential is the automatic, read-only `GITHUB_TOKEN`, which
+  checkout, setup-java, and setup-uv receive by default.
+- **Evidence:** the demo's output goes to the job summary. On failure, `e2e` uploads the demo log
+  and every container's log, and `api` uploads the Surefire reports.
+- **Superseded runs:** off `main`, a newer push cancels the branch's older run. Every run on `main`
+  gets a concurrency group of its own, so it completes. With one group per ref on `main` as well,
+  even `cancel-in-progress: false` would not help: GitHub keeps one waiting run per group, and a
+  newer run replaces it.
+- **Hangs still leave evidence:** the long steps have `timeout-minutes` below their job's. A job
+  that times out is cancelled, which skips the `failure()` steps that upload logs. A step that times
+  out fails, and they still run.
+- **Trust that is not pinned:**
+  - Images are pinned by version tag, not digest. Official images re-push a version's tag when
+    they rebuild it on a patched base, so two runs can build from different bytes.
+  - The Maven Wrapper downloads Maven, and Maven downloads every plugin and dependency, from Maven
+    Central, verified by TLS alone. Python is stricter: `uv.lock` pins a sha256 for every
+    artifact.
+  - The wrapper's `distributionSha256Sum` can't simply be set: without `unzip`, which the JDK build
+    image lacks, `mvnw` fetches the `.tar.gz` instead, and the zip's checksum would fail the image
+    build.
+- **What CI does not show:** timings on a shared 2-CPU runner are not benchmarks. It runs on x86_64,
+  while local development here is arm64.
 
 ## Decision log
 
 | Decision | Why |
 |---|---|
 | Spring Boot 4.1.1, Java 21 LTS | 4.1.1 is Spring Initializr's current GA default (3.5.x is no longer offered). It supports Java 17–26 |
-| Pinned versions (from the Boot 4.1.1 BOM) | Spring Framework 7.0.9, Jackson 3.1.5, Flyway 12.4.0 (verifies PostgreSQL 18), pgjdbc 42.7.13, Testcontainers 2.0.5, JUnit 6.0.3, Maven 3.9.16 through the wrapper. Images: `postgres:18.6-trixie`, `eclipse-temurin:21.0.12.1_1-{jdk,jre}-noble` |
+| Pinned versions (from the Boot 4.1.1 BOM) | Spring Framework 7.0.9, Jackson 3.1.5, Flyway 12.4.0 (verifies PostgreSQL 18), pgjdbc 42.7.13, Testcontainers 2.0.5, JUnit 6.0.3, Maven 3.9.16 through the wrapper. Images: `postgres:18.6-trixie`, `eclipse-temurin:21.0.12.1_1-{jdk,jre}-noble`. Dockerfile frontend: `docker/dockerfile:1.26.0` |
 | `JdbcClient`/`JdbcTemplate` with explicit SQL, no JPA | The locking and guard semantics are the core of the project and stay visible in the SQL |
 | Strict Jackson settings | Jackson 3 ignores unknown fields by default. A typo'd hyperparameter must fail instead of running defaults |
 | UUID attempt ids as fencing tokens | Unguessable, never reused (even if a counter were ever reset), and able to serve as the `attempts` primary key |
@@ -400,5 +967,62 @@ and Flyway migrations (which take an advisory lock) are all safe to run concurre
 | Invariants in the database, policy limits in the API | Invariants must hold for every code path. Limits are tunable |
 | Progress derived from jobs with one aggregate query | There are no stored counters to keep in sync, and the result is consistent by construction |
 | Polling with `204 No Content` for no work | The simplest protocol. Backoff with jitter avoids busy-waiting |
-| Recovery by periodic sweeper, not lazily on claim (planned) | Jobs whose final attempt expired become `FAILED` promptly, and progress stays truthful |
 | Java builds can run in Docker (`scripts/mvnw-docker.sh`) | The dev machine has no JDK. The container uses the same JDK image as the runtime |
+| Claim as one CTE + `UPDATE` statement | Selecting, locking, and transitioning happen atomically, with no window between a read and a write |
+| The service returns a sealed `CompletionOutcome` instead of throwing | The transaction ends normally in both cases, so later increments can record audit rows on rejection without losing them to a rollback. The controller's exhaustive `switch` maps each outcome to HTTP |
+| Rejections share one shape: a `code` plus `jobState` | The MVP had only `ATTEMPT_NOT_CURRENT`; 2.1 carved out `LEASE_EXPIRED`, and 2.3 will add replay and `RESULT_CONFLICT`. Clients that treat any 409 as "stop" stay correct |
+| Concurrency tested at the service layer, and the HTTP contract through MockMvc | The race lives in the database. Real threads, each holding its own connection, reproduce it without HTTP-level noise |
+| Worker stack: Python 3.14.7 (`python:3.14.7-slim-trixie`), torch 2.14.0, numpy 2.5.3, requests 2.34.2, pytest 9.1.1; uv 0.12.20 in the image with `uv.lock` | These were the latest releases on PyPI and Docker Hub at the time, with cp314 wheels for Linux x86_64/aarch64 and macOS arm64. The lockfile pins every transitive dependency |
+| torch from the PyTorch CPU index (`explicit = true`) | PyPI's Linux wheel depends on the CUDA toolkit, cuDNN, and Triton. The CPU build is still 658 MB of the 850 MB environment |
+| numpy pinned even though the code never imports it | torch warns at import when NumPy is missing. Pinning it is better than suppressing the warning |
+| Synthetic spiral dataset instead of a download | Deterministic, instant to generate, needs a nonlinear model, and gives a wide accuracy spread across hyperparameters |
+| One training thread with cooperative cancellation, no subprocess | Heartbeats stay responsive on their own thread, stopping takes milliseconds, and there is no per-job import cost |
+| The client never retries claims; it does retry completions | Claims are not idempotent. Completions are made safe to repeat by the API's guard |
+| Two-stage shutdown | `docker stop` never throws away finished work, and there is still a way to abort quickly |
+| Strict leases | Once `lease_expires_at ≤ now()`, the attempt can do nothing, even before recovery. Its authority window is exactly [claim, last renewal + lease), which is simple to reason about. The cost is that a result arriving a moment late is wasted |
+| One recovery mechanism: a periodic sweep in every API instance | Correct under concurrency without leader election. Failing jobs whose final attempt expired doesn't wait for a claim |
+| Recovery locks, then updates, in one transaction | It needs the expired attempt ids (which the re-queue erases) and must split rows into re-queued and failed. The row locks keep the data stable between statements |
+| Jobs and attempts are updated in one transaction, with row-count checks | A mismatch means the two tables have diverged, and the transaction rolls back instead of committing half a transition |
+| `attempts` backfilled by the migration | Recovery marks the current attempt `EXPIRED` and requires exactly one row. Without the backfill, legacy RUNNING jobs would make every sweep fail |
+| Heartbeats continue through reporting | A slow, retried report would otherwise let the lease lapse after training succeeded |
+| The worker self-fences after a full lease without a successful renewal | Saves compute during outages. It is measured from the last success's receipt, on the local monotonic clock |
+| Tests turn off the periodic sweep (`scheduler.recovery.enabled=false`) | A background sweep would race tests that expire a lease on purpose. The tests call `RecoveryService` directly |
+| `scripts/demo.sh` runs in its own Compose project with 10 s leases, and asserts every claim | The demo is evidence, not a slideshow. It never touches the user's stack, finishes in about 100 s, and exits non-zero on any violation. Its checks were shown to fail against a broken guard |
+| The demo's stale report is sent while the replacement attempt is still running | That is when a missing attempt check would overwrite work. After success, the state and lease guards block the report anyway |
+| A failure report is one guarded `UPDATE` with `CASE`, not a read followed by a write | The budget and authority are checked under the lock that performs the write |
+| `retryable` comes from the worker; the budget comes from the server | Only the worker knows whether an error is deterministic. Only the server can enforce the limit across workers |
+| Every started execution counts against `maxAttempts`, including shutdowns | A simple, uniform rule, and attempt numbers are never reused |
+| Attempt history at `GET /jobs/{id}/attempts`, plus `lastError` on job responses | Details on demand, while list views still show why a job failed without one request per job. Attempt ids are never exposed |
+| The idempotency fingerprint comes from the validated records, and the canonical text is pinned by a golden test | Identity by meaning. Stored fingerprints must survive upgrades; the golden test catches an accidental change, which calls for bumping `VERSION` |
+| A duplicate is detected by `ON CONFLICT` on a unique constraint, not by checking first | A check-then-insert has a window in which two requests both see "no key". The constraint closes it, including against uncommitted rows |
+| A replay returns `200` with `Idempotent-Replayed: true`, not `201` | Nothing was created. The header is the convention Stripe uses |
+| A replayed completion is recognized only after the guarded write was refused, and only from terminal data | The replay path cannot write, and cannot race |
+| `best` ties are broken by `jobIndex` | One ranking metric, as specified, with a deterministic order |
+| `ExperimentService.create` is `@Transactional` even though it only delegates to `submit` | A call on `this` bypasses the proxy. `MANDATORY` propagation made the missing transaction fail on the first test run |
+| CI runs the whole demo on every push, not nightly | It is the project's strongest evidence and takes minutes. With every version pinned, a nightly run of unchanged code would add little |
+| CI triggers on `push`, without `pull_request` | Every push gets a run of its tip commit, and a pull request from a branch of this repo shows that commit's checks. Both triggers would run everything twice |
+| Each CI run on `main` has its own concurrency group | `cancel-in-progress: false` alone protects only the running run: GitHub keeps one waiting run per group and replaces it with a newer one |
+| Step timeouts below the job timeouts | A timed-out job is cancelled, and its `failure()` steps are skipped, so a hang would upload no logs |
+| setup-java with `verify-signature: true` | By default a signature failure, even a missing gpg, is only a warning. Checked locally with setup-java's own bundle: it passes with gpg and fails without. The cost is that a rotated Adoptium signing key fails the job until setup-java is bumped |
+| Images pinned by version tag, not by digest | Re-pushed tags bring the base image's security fixes. A digest would freeze them until someone bumps it |
+| The Maven Wrapper's download is not checksum-pinned | The zip's checksum would break the image build, which gets the `.tar.gz` for lack of `unzip`. Every Maven dependency trusts Central over TLS anyway |
+| Actions pinned by commit SHA (checkout v7.0.1, setup-java v6.0.1, setup-uv v10.2.0, upload-artifact v7.0.1) | A tag can be moved to other code; a commit cannot. Several of these releases are not immutable, and setup-uv no longer publishes major tags |
+| CI's JDK is the image's exact build, and a step checks it | Tests should run on the JDK that production runs. The SemVer spelling differs from the image tag, so the check proves they are the same build |
+| CI installs with `uv sync --locked`; the image uses `--frozen` | CI must fail on a stale lock. The image must install exactly what the lock says |
+| The Dockerfile frontend is pinned (`docker/dockerfile:1.26.0`) | `:1` is a moving tag, so a build could change without a commit. On 2026-09-29 it still resolved to 1.26.0, although 1.27.0 was released on 2026-09-02 |
+| `e2e` builds the images in a step of their own | The build log stays visible, and the demo's `up --build` then only reuses layers |
+| Logs use Spring Boot's built-in ECS format, and the worker reproduces it | No dependency or custom encoder in the API. One query language covers both services |
+| Queries match `event.action`, not message text | Messages are for people. Rewording one must not break a query or the demo |
+| JSON logs only in the Compose stack | IDE and test output stays readable. The stack is what gets operated and queried |
+| Log fields come from SLF4J's fluent API (`addKeyValue`), not the MDC | The ids are known at the call site. The MDC would need scoping across threads (the heartbeat) and request lifecycles |
+| The worker's JSON formatter uses only the standard library | No new dependency in the locked environment |
+| The demo's "never reported" check has a positive control | A check that only asserts an absence passes silently once the format changes. The same query must find attempt 2's result |
+| Dispatch is benchmarked with fake workers that never train (`docs/BENCHMARKS.md`) | It separates the scheduler's own cost per job from training |
+| The benchmark's client runs inside the Compose network, one process per fake worker | Otherwise macOS port forwarding would be measured. In a trial run, one process's interpreter lock capped the client at 16 fake workers |
+| A command-line tool (`./sched`) in standard-library Python 3.9 | Short commands for the whole lifecycle, with no install step: macOS and most Linux systems already have Python 3.9 |
+| `GET /experiments` lists the newest experiments | The CLI defaults to the latest experiment without keeping state, so it stays right after a restart or from another terminal |
+| Every benchmark run checks that each job was claimed and completed exactly once | Numbers from a run that broke correctness would describe the wrong system. Under load, the check doubles as a concurrency test |
+| Benchmark CPU comes from cgroup counters read before and after | They are exact, and cost nothing while the measurement runs, unlike sampling `docker stats` |
+| Benchmark repetitions are interleaved by round | Drift during a long run, from heat or background load, affects every level alike |
+| Benchmark results are generated files, and the docs' results section is regenerated from them | No number in the docs is typed by hand, so none can drift from what was measured |
+| The benchmark's pool-size and log-level knobs default to the stack's own values | The default run measures the stack as it ships; an experiment changes one thing |

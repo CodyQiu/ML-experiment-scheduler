@@ -3,7 +3,7 @@ package dev.codyqiu.scheduler.job;
 import java.time.Instant;
 
 import dev.codyqiu.scheduler.task.SyntheticMlpConfig;
-import tools.jackson.databind.JsonNode;
+import dev.codyqiu.scheduler.task.TrainingMetrics;
 
 /**
  * A job as exposed to researchers. The attempt identity is deliberately absent: it is the
@@ -20,8 +20,10 @@ public record JobResponse(
 		int maxAttempts,
 		String workerId,
 		Double valAccuracy,
-		JsonNode result,
+		TrainingMetrics result,
 		Instant createdAt,
 		Instant startedAt,
-		Instant finishedAt) {
+		Instant finishedAt,
+		Instant leaseExpiresAt,
+		JobError lastError) {
 }

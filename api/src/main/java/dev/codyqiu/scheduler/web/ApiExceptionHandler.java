@@ -4,6 +4,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,6 +24,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
@@ -44,9 +46,21 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 		return problem(HttpStatus.NOT_FOUND, "NOT_FOUND", ex.getMessage());
 	}
 
+	@ExceptionHandler(RequestValidationException.class)
+	ProblemDetail handleInvalidRequest(RequestValidationException ex) {
+		return validationProblem(List.of(new FieldViolation(ex.field(), ex.getMessage())));
+	}
+
+	@ExceptionHandler(ConflictException.class)
+	ProblemDetail handleConflict(ConflictException ex) {
+		ProblemDetail problem = problem(HttpStatus.CONFLICT, ex.code(), ex.getMessage());
+		ex.properties().forEach(problem::setProperty);
+		return problem;
+	}
+
 	@ExceptionHandler(Exception.class)
 	ProblemDetail handleUnexpected(Exception ex) {
-		log.error("Unhandled exception", ex);
+		log.atError().addKeyValue("event.action", "request.failed").setCause(ex).log("Unhandled exception");
 		return problem(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Unexpected server error");
 	}
 
@@ -58,6 +72,21 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 			.getFieldErrors()
 			.stream()
 			.map(error -> new FieldViolation(error.getField(), error.getDefaultMessage()))
+			.sorted(Comparator.comparing(FieldViolation::field).thenComparing(FieldViolation::message))
+			.toList();
+		return handleExceptionInternal(ex, validationProblem(violations), headers, status, request);
+	}
+
+	/** Constraint violations on parameters such as {@code ?limit=}, named after the parameter. */
+	@Override
+	protected ResponseEntity<Object> handleHandlerMethodValidationException(HandlerMethodValidationException ex,
+			HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+		List<FieldViolation> violations = ex.getParameterValidationResults()
+			.stream()
+			.flatMap(result -> result.getResolvableErrors()
+				.stream()
+				.map(error -> new FieldViolation(result.getMethodParameter().getParameterName(),
+						error.getDefaultMessage())))
 			.sorted(Comparator.comparing(FieldViolation::field).thenComparing(FieldViolation::message))
 			.toList();
 		return handleExceptionInternal(ex, validationProblem(violations), headers, status, request);
@@ -124,6 +153,9 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 		}
 		if (target == String.class) {
 			return "must be a string";
+		}
+		if (target == UUID.class) {
+			return "must be a UUID";
 		}
 		if (Collection.class.isAssignableFrom(target)) {
 			return "must be an array";

@@ -1,0 +1,32 @@
+[project]
+name = "scheduler-worker"
+version = "0.1.0"
+description = "Claims jobs from the ML experiment scheduler, trains them with PyTorch, and reports metrics"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    # torch works without NumPy but warns about it at import, so pin it rather than hide the warning.
+    "numpy==2.5.3",
+    "requests==2.34.2",
+    "torch==2.14.0",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.uv]
+# The worker runs in Linux containers; macOS is for local development.
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]
+
+# PyPI's Linux torch wheels pull in the CUDA toolkit (gigabytes). The CPU index serves CPU-only
+# builds (2.14.0+cpu on Linux, the regular wheel on macOS), so torch alone comes from there.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

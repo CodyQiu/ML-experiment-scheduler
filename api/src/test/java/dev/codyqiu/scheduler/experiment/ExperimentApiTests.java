@@ -80,15 +80,16 @@ class ExperimentApiTests extends IntegrationTest {
 		jdbc.sql("""
 				UPDATE jobs
 				SET state = 'RUNNING', attempt_count = 1, current_attempt_id = gen_random_uuid(),
-				    worker_id = 'worker-a', started_at = now()
+				    worker_id = 'worker-a', started_at = now(), lease_expires_at = now() + interval '30 seconds'
 				WHERE job_index IN (1, 2, 3)
 				""").update();
 		jdbc.sql("""
 				UPDATE jobs
-				SET state = 'SUCCEEDED', val_accuracy = 0.9, result = '{"valAccuracy": 0.9}', finished_at = now()
+				SET state = 'SUCCEEDED', val_accuracy = 0.9, result = '{"valAccuracy": 0.9}', finished_at = now(),
+				    lease_expires_at = NULL
 				WHERE job_index = 2
 				""").update();
-		jdbc.sql("UPDATE jobs SET state = 'FAILED', finished_at = now() WHERE job_index = 3").update();
+		jdbc.sql("UPDATE jobs SET state = 'FAILED', finished_at = now(), lease_expires_at = NULL WHERE job_index = 3").update();
 
 		assertProgress(body(get("/experiments/1")), 5, 2, 1, 1, 1);
 	}
@@ -191,6 +192,52 @@ class ExperimentApiTests extends IntegrationTest {
 	}
 
 	@Test
+	void theListShowsTheNewestExperimentsFirstEachAsItsOwnEndpointShowsIt() throws Exception {
+		for (int size = 1; size <= 3; size++) {
+			post(experiment(2, IntStream.range(0, size).mapToObj(i -> job(i, config(0.01))).toList()));
+		}
+		// Jobs of experiment 3 in every state, so the list's counts are checked beyond "all queued".
+		jdbc.sql("""
+				UPDATE jobs
+				SET state = 'RUNNING', attempt_count = 1, current_attempt_id = gen_random_uuid(),
+				    worker_id = 'worker-a', started_at = now(), lease_expires_at = now() + interval '30 seconds'
+				WHERE experiment_id = 3 AND job_index IN (1, 2)
+				""").update();
+		jdbc.sql("""
+				UPDATE jobs
+				SET state = 'SUCCEEDED', val_accuracy = 0.9, result = '{"valAccuracy": 0.9}', finished_at = now(),
+				    lease_expires_at = NULL
+				WHERE experiment_id = 3 AND job_index = 2
+				""").update();
+
+		JsonNode experiments = body(get("/experiments")).get("experiments");
+
+		assertThat(ids(experiments)).containsExactly(3L, 2L, 1L);
+		assertProgress(experiments.get(0), 3, 1, 1, 1, 0);
+		for (JsonNode listed : experiments) {
+			assertThat(listed).isEqualTo(body(get("/experiments/" + listed.get("id").asLong())));
+		}
+	}
+
+	@Test
+	void theListIsEmptyWithoutExperimentsAndHonorsItsLimit() throws Exception {
+		assertThat(body(get("/experiments")).get("experiments").size()).isZero();
+		for (int i = 0; i < 3; i++) {
+			post(experiment(1, List.of(job(0, config(0.01)))));
+		}
+
+		assertThat(ids(body(get("/experiments?limit=2")).get("experiments"))).containsExactly(3L, 2L);
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = { "0", "101" })
+	void theListLimitMustBeBetweenOneAndOneHundred(String limit) throws Exception {
+		JsonNode problem = assertProblem(get("/experiments?limit=" + limit), HttpStatus.BAD_REQUEST, "VALIDATION_FAILED");
+
+		assertThat(problem.get("errors").get(0).get("field").asString()).isEqualTo("limit");
+	}
+
+	@Test
 	void frameworkErrorsUseTheSameProblemFormat() throws Exception {
 		assertProblem(mvc.delete().uri("/experiments/1").exchange(), HttpStatus.METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
 		assertProblem(get("/experiments/not-a-number"), HttpStatus.BAD_REQUEST, "BAD_REQUEST");
@@ -218,6 +265,12 @@ class ExperimentApiTests extends IntegrationTest {
 		assertThat(problem.get("status").asInt()).isEqualTo(status.value());
 		assertThat(problem.get("code").asString()).isEqualTo(code);
 		return problem;
+	}
+
+	private static List<Long> ids(JsonNode experiments) {
+		List<Long> ids = new ArrayList<>();
+		experiments.forEach((experiment) -> ids.add(experiment.get("id").asLong()));
+		return ids;
 	}
 
 	private static List<String> fieldErrors(JsonNode problem) {
