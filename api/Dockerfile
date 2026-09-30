@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.26.0
 
 # Build stage: package the jar with the Maven Wrapper. Tests are not run here because they
 # need Docker for Testcontainers; run them with ./mvnw verify or scripts/mvnw-docker.sh verify.

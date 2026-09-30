@@ -1,6 +1,6 @@
 # Progress
 
-_Last updated: 2026-09-29_ (milestone 2 complete)
+_Last updated: 2026-09-29_ (milestone 2 complete; 3.1 awaiting its first GitHub run)
 
 ## Status
 
@@ -11,7 +11,8 @@ _Last updated: 2026-09-29_ (milestone 2 complete)
 | 2.2 | Failure reports (retryable or not), bounded retries on reported failures, attempt history in the API | done |
 | 2.3 | Idempotent submission, safe repeated completion, best-configurations endpoint | done |
 | 2.4 | Scripted end-to-end demo with checks (`scripts/demo.sh`) | done |
-| M3 | CI, structured logs, architecture README, benchmarks | next |
+| 3.1 | CI (GitHub Actions): API tests, worker tests, and the checked demo on every push | built and replayed locally; not yet run on GitHub |
+| 3.2–3.4 | Structured logs, benchmarks, architecture README | next |
 
 ## Completed
 
@@ -44,7 +45,8 @@ _Last updated: 2026-09-29_ (milestone 2 complete)
   successful renewal stops training at the next minibatch.
 - **`CLAUDE.md`:** commands, architecture rules, testing conventions, and environment gotchas.
 
-Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3 as `eefcd0e`.
+Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3 as `eefcd0e`, and 2.4
+as `b62e554`.
 
 **2.2**
 
@@ -92,7 +94,69 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
 - **`RecoverySweeper`** now schedules itself from `SchedulerProperties`, so all lease policy has
   one binding path. It logs the effective policy at startup.
 
+**3.1**
+
+- **`.github/workflows/ci.yml`** runs three parallel jobs on `ubuntu-24.04` for every push, and on
+  demand:
+  - **`api`:** `./mvnw -B -ntp verify` on the image's exact Temurin build. setup-java gets
+    `21.0.12+101.0.LTS` with `verify-signature: true`, and a step checks `$JAVA_HOME/release`. The
+    Maven cache is keyed on the POM and the wrapper properties.
+  - **`worker`:** setup-uv installs uv 0.12.20, with its checksum pinned, and sets
+    `UV_PYTHON=3.14.7`. Then `uv sync --locked`, which downloads CPython 3.14.7, and
+    `uv run --no-sync pytest`.
+  - **`e2e`:** builds both images, then runs `scripts/demo.sh` and puts its output in the job
+    summary. Logs are uploaded on failure.
+  - The actions are pinned by SHA. The token is limited to `contents: read` and not persisted.
+  - Off `main`, a newer push cancels a branch's older run. Each run on `main` has its own group.
+  - The long steps time out before their job does, so a hang still uploads logs.
+- **Dockerfile frontend pinned** to `docker/dockerfile:1.26.0`; it was the moving `:1`.
+- **`scripts/demo.sh`:**
+  - It prints the end of `compose up`'s output when the stack fails to start. A build error never
+    reaches the containers' logs.
+  - The sweep's hang guard went from 180 s to 300 s, and the crash scenario's from 90 s to 120 s.
+    A 2-CPU x86 runner was estimated at roughly 45–145 s for the sweep, leaving too little
+    headroom.
+- **`CLAUDE.md`:** the CI commands, and the rules for keeping versions in sync with the images.
+
 ## Verified (2026-09-29: macOS arm64, Docker Desktop 29.2.0)
+
+**3.1, replayed locally; not yet run on GitHub.** Each job's `run:` steps were extracted from
+`ci.yml` and run with `bash --noprofile --norc -eo pipefail`, as `shell: bash` does on the runner.
+
+- **`e2e`:**
+  - Every demo container was confined to 2 CPUs (`cpuset: "0,1"`, confirmed with `docker
+    inspect`): 17/17 checks passed, the demo took 89 s, and the sweep took 25 s.
+  - The same with amd64 images under Rosetta: 17/17 checks passed; the demo took 160 s and the
+    sweep 45 s, against the old 180 s limit.
+  - The final state, unconfined, against the repo itself: 17/17 in 64 s. The summary step wrote
+    the fenced demo output to the local file standing in for `$GITHUB_STEP_SUMMARY`. The
+    log-collection step, forced to run, captured `ps -a` plus every container's log.
+- **Failure paths:**
+  - `scripts/demo.sh bogus | tee` exits 2 under pipefail, and 0 without it.
+  - When the stack could not start, compose's reason was printed. The summary step and the log
+    collection still ran, although there were no containers to take logs from.
+  - The summary step is a no-op when there is no log.
+- **`api`:** 142 tests, 0 failures at `--cpus=2`, including a clean compile.
+  - `Check the JDK build` passes on the image's JDK.
+  - setup-java's own bundle was run in an amd64 container with the CI's `java-version` and
+    `verify-signature`, but without the cache service. It resolved `21.0.12+101.0.LTS` to the
+    `jdk-21.0.12.1+1` tarball, whose sha256 matches the image's.
+  - The signature verified with gpg present. Without gpg the step failed, where the default only
+    warns.
+- **`worker`:** on amd64 Ubuntu 24.04 with uv 0.12.20 and `UV_PYTHON=3.14.7`, 62 passed, including
+  5 runs at `--cpus=2`. `uv sync --locked` refused a changed pin.
+- **Pins:**
+  - All four action SHAs equal their release tags, and each is the latest stable release.
+  - The uv checksum matches the release's `.sha256` file and the downloaded tarball.
+  - `docker/dockerfile:1` and `:1.26.0` have the same digest.
+- **Linters:** actionlint 1.7.12 with shellcheck reports 0 errors. zizmor 1.30.1 (default,
+  pedantic, and auditor personas) has no findings; its positive control found 7 on a deliberately
+  bad copy.
+- **Differences from a real runner:**
+  - The `e2e` replays used Docker 29.2 with Compose v5 and macOS's bash 3.2.
+  - The ubuntu-24.04 image's published software list gives Docker 28.0.4, Compose 2.38.2, and bash
+    5.2. None of these has been observed on a run yet.
+  - The build and the demo's own shell were not CPU-confined, and the builds were warm.
 
 **2.4, the demo itself (verified against real containers):**
 
@@ -228,17 +292,24 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
   never expire.
 - **Strictness is bounded by statement duration.** A lease is judged at its transaction's start,
   so a completion can win by the milliseconds its statement takes (see DESIGN.md).
-- **Other:** no CI, bodies parsed before size limits, no local JDK.
+- **CI has not run on GitHub yet.** Its jobs were replayed locally under CI-like limits (see
+  Verified), but the runner's Docker and Compose versions differ from Docker Desktop's.
+- **Not everything in CI is pinned by content:**
+  - images are pinned by version tag, not digest;
+  - Maven and its dependencies are trusted over TLS (see DESIGN.md, Continuous integration).
+- **Other:** bodies parsed before size limits, no local JDK.
 
-## Next: milestone 3 (evidence and polish)
+## Next: the rest of milestone 3 (evidence and polish)
 
-1. **3.1 CI (GitHub Actions):**
-   - `./mvnw verify`, with Testcontainers on the runner's Docker;
-   - `uv run pytest`;
-   - building both images;
-   - optionally, `scripts/demo.sh` as a nightly end-to-end job.
+1. **The first CI run:** push `milestone-2`, then check the three jobs and the demo's summary in the
+   Actions tab. Runner timings go here as observations, not benchmarks.
 2. **3.2 Structured logs:** JSON logs from the API (Spring Boot's structured logging) and the
    worker, carrying `experimentId`, `jobId`, `attemptNumber`/`attemptId`, and `workerId` as fields.
+   - `scripts/demo.sh` greps four log lines, so it must change along with the format:
+     - the API's `Recovering expired leases every …` and `Claimed job … attempt 1 (…)`;
+     - the worker's `job=… attempt=1 lease lost` and `job=… attempt=1 done`.
+   - CI would catch a stale pattern for the first three, whose checks would fail. The last one
+     must be absent, so a stale pattern would pass without a word.
 3. **3.3 Benchmark:**
    - `scripts/benchmark.sh` measures API latency (claim, complete, submit) separately from training
      throughput at 1, 2, and 4 workers;

@@ -47,7 +47,7 @@ get()  { curl -sS "$API$1"; }
 post() { local path=$1; shift; curl -sS -X POST "$API$path" -H 'Content-Type: application/json' "$@"; }
 
 start_stack() {
-  local tool policy
+  local tool output policy
   for tool in docker curl jq python3; do
     command -v "$tool" >/dev/null || die "$tool is required"
   done
@@ -55,8 +55,11 @@ start_stack() {
     die "something already answers on $API (set DEMO_API_PORT to use another port)"
   fi
   say "starting $PROJECT: PostgreSQL, the API on $API, $WORKERS workers (the first run builds images)"
-  dc up -d --build --wait --scale worker="$WORKERS" >/dev/null 2>&1 \
-    || die "the stack did not start; see: docker compose -p $PROJECT logs"
+  # Quiet on success. On failure, show why: a build error never reaches the containers' logs.
+  if ! output=$(dc up -d --build --wait --scale worker="$WORKERS" 2>&1); then
+    printf '%s\n' "$output" | tail -n 20 >&2
+    die "the stack did not start; see: docker compose -p $PROJECT logs"
+  fi
   policy=$(dc logs api 2>&1 | grep -o 'Recovering expired leases every.*' | head -1)
   say "API: ${policy:-policy line not found}"
   check "the demo's short leases are in effect (10 s lease, 3 s heartbeats, 1 s sweeps)" \
@@ -129,7 +132,7 @@ sweep() {
   say "the same submission again, as if the first response had been lost: experiment $again"
   check "resubmitting with the same Idempotency-Key created nothing new" test "$again" = "$exp"
 
-  deadline=$((SECONDS + 180))
+  deadline=$((SECONDS + 300))  # a hang guard, not a speed check: a 2-CPU CI runner needs the headroom
   while ((SECONDS < deadline)); do
     progress=$(get "/experiments/$exp" | jq -c .progress)
     running=$(jq .running <<<"$progress")
@@ -164,7 +167,7 @@ crash() {
   sleep 2
   docker kill -s KILL "$victim" >/dev/null
   say "SIGKILL $victim while it trains job $job: no cleanup, and nothing renews its lease any more"
-  follow "$job" 90 '^(SUCCEEDED|FAILED)' || return
+  follow "$job" 120 '^(SUCCEEDED|FAILED)' || return
   print_attempts "$job"
   history=$(get "/jobs/$job/attempts")
   check "the job succeeded despite the crash" test "$(field "$job" .state)" = SUCCEEDED

@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.26.0
 FROM python:3.14.7-slim-trixie
 
 # uv installs exactly what uv.lock pins, including the CPU-only torch build for Linux.

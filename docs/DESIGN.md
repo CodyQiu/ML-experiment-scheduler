@@ -815,12 +815,63 @@ A shutdown still consumes an attempt from the budget, like any other execution t
 Giving it back would mean reusing an attempt number, which `attempts_job_attempt_number_unique`
 forbids.
 
+## Continuous integration (`.github/workflows/ci.yml`)
+
+Every push starts three independent jobs, each on a fresh GitHub-hosted `ubuntu-24.04` x86_64 runner.
+They run the local development commands, made stricter where CI must fail on drift (`uv sync
+--locked`, then `uv run --no-sync pytest`, instead of `uv run pytest`). A green run therefore means
+those commands work from a clean checkout. Each push tests its tip commit. `workflow_dispatch` also allows a run on
+demand, from the Actions tab once the workflow is on `main`.
+
+| Job | Runs | Shows |
+|---|---|---|
+| `api` | `./mvnw -B -ntp verify` on Temurin 21.0.12.1+1 | Every API test passes against PostgreSQL 18.6 in Testcontainers, on the JDK build the API image runs |
+| `worker` | `uv sync --locked`, then `uv run --no-sync pytest`, with uv 0.12.20, CPython 3.14.7, and one OpenMP thread | The worker tests pass with x86_64 torch, and `uv.lock` matches `pyproject.toml` |
+| `e2e` | `docker compose … build`, then `scripts/demo.sh` | Both images build from a clean checkout, and all 17 demo checks pass: the sweep, crash recovery, and stale-worker fencing |
+
+- **Pinned like everything else:**
+  - Each action is pinned to a full commit SHA, with its release in a comment.
+  - The runner label is `ubuntu-24.04`, not `ubuntu-latest`.
+  - setup-java names the image's JDK build in Adoptium's SemVer, `21.0.12+101.0.LTS`. A step then
+    checks `$JAVA_HOME/release` for `21.0.12.1+1`. Shorter spellings either float, or match the
+    JDK preinstalled on the runner.
+  - `verify-signature: true` makes setup-java fail, instead of warn, when the JDK's GPG signature
+    does not verify. The download's sha256 comes from the same Adoptium API as its URL.
+  - setup-uv is given the uv release's checksum, because this release of the action predates uv
+    0.12.20.
+  - The runner image brings its own Docker and Compose, which the workflow does not pin. The
+    ubuntu-24.04 image's published software list gives 28.0.4 and 2.38.2; neither has been
+    observed on a run yet.
+- **Least privilege:** `permissions: contents: read`, and checkout does not persist its token. No
+  repository secrets are used. The only credential is the automatic, read-only `GITHUB_TOKEN`, which
+  checkout, setup-java, and setup-uv receive by default.
+- **Evidence:** the demo's output goes to the job summary. On failure, `e2e` uploads the demo log
+  and every container's log, and `api` uploads the Surefire reports.
+- **Superseded runs:** off `main`, a newer push cancels the branch's older run. Every run on `main`
+  gets a concurrency group of its own, so it completes. With one group per ref on `main` as well,
+  even `cancel-in-progress: false` would not help: GitHub keeps one waiting run per group, and a
+  newer run replaces it.
+- **Hangs still leave evidence:** the long steps have `timeout-minutes` below their job's. A job
+  that times out is cancelled, which skips the `failure()` steps that upload logs. A step that times
+  out fails, and they still run.
+- **Trust that is not pinned:**
+  - Images are pinned by version tag, not digest. Official images re-push a version's tag when
+    they rebuild it on a patched base, so two runs can build from different bytes.
+  - The Maven Wrapper downloads Maven, and Maven downloads every plugin and dependency, from Maven
+    Central, verified by TLS alone. Python is stricter: `uv.lock` pins a sha256 for every
+    artifact.
+  - The wrapper's `distributionSha256Sum` can't simply be set: without `unzip`, which the JDK build
+    image lacks, `mvnw` fetches the `.tar.gz` instead, and the zip's checksum would fail the image
+    build.
+- **What CI does not show:** timings on a shared 2-CPU runner are not benchmarks. It runs on x86_64,
+  while local development here is arm64.
+
 ## Decision log
 
 | Decision | Why |
 |---|---|
 | Spring Boot 4.1.1, Java 21 LTS | 4.1.1 is Spring Initializr's current GA default (3.5.x is no longer offered). It supports Java 17–26 |
-| Pinned versions (from the Boot 4.1.1 BOM) | Spring Framework 7.0.9, Jackson 3.1.5, Flyway 12.4.0 (verifies PostgreSQL 18), pgjdbc 42.7.13, Testcontainers 2.0.5, JUnit 6.0.3, Maven 3.9.16 through the wrapper. Images: `postgres:18.6-trixie`, `eclipse-temurin:21.0.12.1_1-{jdk,jre}-noble` |
+| Pinned versions (from the Boot 4.1.1 BOM) | Spring Framework 7.0.9, Jackson 3.1.5, Flyway 12.4.0 (verifies PostgreSQL 18), pgjdbc 42.7.13, Testcontainers 2.0.5, JUnit 6.0.3, Maven 3.9.16 through the wrapper. Images: `postgres:18.6-trixie`, `eclipse-temurin:21.0.12.1_1-{jdk,jre}-noble`. Dockerfile frontend: `docker/dockerfile:1.26.0` |
 | `JdbcClient`/`JdbcTemplate` with explicit SQL, no JPA | The locking and guard semantics are the core of the project and stay visible in the SQL |
 | Strict Jackson settings | Jackson 3 ignores unknown fields by default. A typo'd hyperparameter must fail instead of running defaults |
 | UUID attempt ids as fencing tokens | Unguessable, never reused (even if a counter were ever reset), and able to serve as the `attempts` primary key |
@@ -860,3 +911,15 @@ forbids.
 | A replayed completion is recognized only after the guarded write was refused, and only from terminal data | The replay path cannot write, and cannot race |
 | `best` ties are broken by `jobIndex` | One ranking metric, as specified, with a deterministic order |
 | `ExperimentService.create` is `@Transactional` even though it only delegates to `submit` | A call on `this` bypasses the proxy. `MANDATORY` propagation made the missing transaction fail on the first test run |
+| CI runs the whole demo on every push, not nightly | It is the project's strongest evidence and takes minutes. With every version pinned, a nightly run of unchanged code would add little |
+| CI triggers on `push`, without `pull_request` | Every push gets a run of its tip commit, and a pull request from a branch of this repo shows that commit's checks. Both triggers would run everything twice |
+| Each CI run on `main` has its own concurrency group | `cancel-in-progress: false` alone protects only the running run: GitHub keeps one waiting run per group and replaces it with a newer one |
+| Step timeouts below the job timeouts | A timed-out job is cancelled, and its `failure()` steps are skipped, so a hang would upload no logs |
+| setup-java with `verify-signature: true` | By default a signature failure, even a missing gpg, is only a warning. Checked locally with setup-java's own bundle: it passes with gpg and fails without. The cost is that a rotated Adoptium signing key fails the job until setup-java is bumped |
+| Images pinned by version tag, not by digest | Re-pushed tags bring the base image's security fixes. A digest would freeze them until someone bumps it |
+| The Maven Wrapper's download is not checksum-pinned | The zip's checksum would break the image build, which gets the `.tar.gz` for lack of `unzip`. Every Maven dependency trusts Central over TLS anyway |
+| Actions pinned by commit SHA (checkout v7.0.1, setup-java v6.0.1, setup-uv v10.2.0, upload-artifact v7.0.1) | A tag can be moved to other code; a commit cannot. Several of these releases are not immutable, and setup-uv no longer publishes major tags |
+| CI's JDK is the image's exact build, and a step checks it | Tests should run on the JDK that production runs. The SemVer spelling differs from the image tag, so the check proves they are the same build |
+| CI installs with `uv sync --locked`; the image uses `--frozen` | CI must fail on a stale lock. The image must install exactly what the lock says |
+| The Dockerfile frontend is pinned (`docker/dockerfile:1.26.0`) | `:1` is a moving tag, so a build could change without a commit. On 2026-09-29 it still resolved to 1.26.0, although 1.27.0 was released on 2026-09-02 |
+| `e2e` builds the images in a step of their own | The build log stays visible, and the demo's `up --build` then only reuses layers |

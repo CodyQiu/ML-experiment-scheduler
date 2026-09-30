@@ -1,0 +1,156 @@
+# Continuous integration: the commands of local development (see CLAUDE.md), run on a fresh
+# GitHub-hosted x86_64 runner for every push.
+#
+# Every action is pinned to a full commit SHA, because a tag can be moved to other code and a commit
+# cannot. The trailing comment names the release. Versions shared with the images (JDK, uv, Python)
+# must match api/Dockerfile and worker/Dockerfile.
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Off main, a newer push cancels the branch's older run. Every run on main gets a group of its
+  # own, so none is cancelled, or replaced while it waits.
+  group: ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # An explicit bash runs steps with -eo pipefail: a failure anywhere in a pipeline fails it.
+    shell: bash
+
+jobs:
+  api:
+    name: API tests (PostgreSQL via Testcontainers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        # Repeated: it is unclear whether job defaults merge with the workflow's or replace them.
+        shell: bash
+        working-directory: api
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          # Temurin 21.0.12.1+1, the JDK of api/Dockerfile and scripts/mvnw-docker.sh, as Adoptium
+          # spells it in SemVer. Shorter spellings either float or match the runner's own JDK.
+          java-version: '21.0.12+101.0.LTS'
+          # Fail, rather than warn, if the JDK's signature does not verify against Adoptium's key.
+          verify-signature: true
+          cache: maven
+          cache-dependency-path: |
+            api/pom.xml
+            api/.mvn/wrapper/maven-wrapper.properties
+
+      - name: Check the JDK build
+        run: grep -Fx 'SEMANTIC_VERSION="21.0.12.1+1"' "$JAVA_HOME/release"
+
+      - name: Build and test
+        # Below the job's limit: a timed-out step fails and the reports are still uploaded. A
+        # timed-out job is cancelled, and failure() steps are skipped.
+        timeout-minutes: 15
+        run: ./mvnw -B -ntp verify
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-test-reports-${{ github.run_attempt }}
+          path: api/target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  worker:
+    name: Worker tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: worker
+    env:
+      # One compute thread, as in worker/Dockerfile.
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # The uv and Python of worker/Dockerfile. python-version sets UV_PYTHON, which overrides
+          # worker/.python-version ("3.14"), so uv installs exactly 3.14.7.
+          version: "0.12.20"
+          python-version: "3.14.7"
+          # sha256 of uv 0.12.20 for x86_64 Linux. This action release predates 0.12.20 and would
+          # otherwise trust a checksum fetched at run time.
+          checksum: 6590717592ace991ff83a63fef799e3ad9d33ecc8f96c5d6bdd732496e79337f
+
+      - name: Install the locked environment
+        # --locked fails when uv.lock is out of date with pyproject.toml. The image's --frozen
+        # would install the stale lock without a word.
+        run: uv sync --locked
+
+      - name: Run tests
+        run: uv run --no-sync pytest
+
+  e2e:
+    name: End-to-end demo (sweep, crash recovery, stale worker)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the images
+        # Its own step keeps the build log visible. The demo's "up --build" then reuses the layers.
+        timeout-minutes: 12
+        run: docker compose -p mlsched-demo -f compose.yaml -f scripts/demo/compose.demo.yaml build
+
+      - name: Run scripts/demo.sh
+        # KEEP=1 leaves the containers for the log collection below; the runner is discarded anyway.
+        # The step limits stay below the job's, so a hang still leaves logs (see the api job).
+        timeout-minutes: 15
+        env:
+          KEEP: "1"
+        run: scripts/demo.sh 2>&1 | tee "$RUNNER_TEMP/demo.log"
+
+      - name: Add the demo's output to the job summary
+        if: ${{ !cancelled() }}
+        run: |
+          [ -f "$RUNNER_TEMP/demo.log" ] || exit 0
+          {
+            echo '### scripts/demo.sh'
+            echo '```'
+            cat "$RUNNER_TEMP/demo.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect container logs
+        if: failure()
+        run: |
+          dc() { docker compose -p mlsched-demo -f compose.yaml -f scripts/demo/compose.demo.yaml "$@"; }
+          { dc ps -a; dc logs --no-color --timestamps; } > "$RUNNER_TEMP/containers.log" 2>&1 || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-logs-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/demo.log
+            ${{ runner.temp }}/containers.log
+          if-no-files-found: ignore
+          retention-days: 14

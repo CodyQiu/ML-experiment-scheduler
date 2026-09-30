@@ -7,8 +7,9 @@ bounded retries, and idempotent submission, all backed by PostgreSQL.
 
 **Status:** milestones 1 (end-to-end MVP) and 2 (reliability) are complete. That covers atomic
 claims, leases and heartbeats, crash recovery, failure reports with bounded retries, idempotent
-submission, safe repeated completion, and a checked end-to-end demo. Milestone 3 (CI, structured
-logs, benchmarks) is next.
+submission, safe repeated completion, and a checked end-to-end demo. Milestone 3 has begun: a CI
+workflow that runs both test suites and the demo on every push is in place, replayed locally but not
+yet run on GitHub. Structured logs and benchmarks are next.
 
 ## See it handle failure
 
@@ -122,9 +123,13 @@ scripts/mvnw-docker.sh verify    # without one: runs the Maven Wrapper in a JDK 
 cd worker && uv run pytest       # worker tests; uv installs the locked environment into worker/.venv
 ```
 
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs both suites and `scripts/demo.sh`
+on every push, on a fresh GitHub-hosted runner. The demo's output appears in each run's summary.
+
 ## Layout
 
 ```
+.github/        workflows/ci.yml: API tests, worker tests, and the demo on every push
 api/            Spring Boot service: REST API, scheduling rules, all database access
   src/main/resources/db/migration/   Flyway SQL migrations
 worker/         Python worker: claim → train (PyTorch, CPU) → report
