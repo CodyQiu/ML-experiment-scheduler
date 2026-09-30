@@ -1,6 +1,7 @@
 """The worker loop against a fake API and a fake training function."""
 
 import copy
+import logging
 import time
 from uuid import uuid4
 
@@ -48,6 +49,7 @@ class FakeApi:
         self.completed.append((job_id, str(attempt_id), metrics))
         if self.complete_error:
             raise self.complete_error
+        return False  # like ApiClient.complete: whether the API acknowledged it as a replay
 
     def heartbeat(self, job_id, attempt_id):
         self.heartbeats += 1
@@ -267,3 +269,37 @@ def test_an_unreachable_api_for_a_full_lease_stops_training():
     assert api.completed == []
     assert api.heartbeats >= 2
     assert time.monotonic() - started < 2  # training itself stopped; nothing ran to completion
+
+
+def events(caplog, action):
+    return [record for record in caplog.records if getattr(record, "event.action", None) == action]
+
+
+def test_every_log_about_an_attempt_carries_its_ids(caplog):
+    caplog.set_level(logging.INFO)
+    claimed = assignment(1)
+    api = FakeApi(claimed)
+    worker, _ = make_worker(api)
+
+    worker.run()
+
+    [started], [done] = events(caplog, "training.started"), events(caplog, "result.accepted")
+    for record in (started, done):
+        assert (record.experimentId, record.jobId, record.attemptNumber, record.attemptId) == (
+            1, 1, 1, claimed["attemptId"])
+        assert record.getMessage().startswith("job=1 attempt=1 ")
+    assert (done.valAccuracy, done.replayed) == (0.9, False)
+
+
+def test_a_lost_lease_is_logged_as_such_with_the_attempts_ids(caplog):
+    caplog.set_level(logging.INFO)
+    claimed = assignment(1, heartbeat_interval=0.01, lease=1.0)
+    api = FakeApi(claimed, heartbeat_error=AttemptRejected(1, "ATTEMPT_NOT_CURRENT", "RUNNING", "reassigned"))
+    worker, _ = make_worker(api, train=train_until_stopped)
+
+    worker.run()
+
+    [lost] = events(caplog, "lease.lost")
+    assert (lost.jobId, lost.attemptId) == (1, claimed["attemptId"])
+    assert "ATTEMPT_NOT_CURRENT" in lost.reason
+    assert events(caplog, "result.accepted") == []

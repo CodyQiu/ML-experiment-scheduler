@@ -46,8 +46,13 @@ dc()   { docker compose -p "$PROJECT" -f compose.yaml -f scripts/demo/compose.de
 get()  { curl -sS "$API$1"; }
 post() { local path=$1; shift; curl -sS -X POST "$API$path" -H 'Content-Type: application/json' "$@"; }
 
+# Log events: the JSON lines of the API's or one container's log, one object per line. Anything
+# else on the stream (a stop signal's notice, say) is skipped. docs/DESIGN.md lists the fields.
+api_events()       { dc logs --no-log-prefix api 2>/dev/null | jq -c -R 'fromjson? // empty'; }
+container_events() { docker logs "$1" 2>&1 | jq -c -R 'fromjson? // empty'; }
+
 start_stack() {
-  local tool output policy
+  local tool output policy message
   for tool in docker curl jq python3; do
     command -v "$tool" >/dev/null || die "$tool is required"
   done
@@ -60,10 +65,11 @@ start_stack() {
     printf '%s\n' "$output" | tail -n 20 >&2
     die "the stack did not start; see: docker compose -p $PROJECT logs"
   fi
-  policy=$(dc logs api 2>&1 | grep -o 'Recovering expired leases every.*' | head -1)
-  say "API: ${policy:-policy line not found}"
+  policy=$(api_events | jq -c 'select(.event.action == "recovery.policy")' | head -1)
+  message=$(jq -r .message <<<"$policy" 2>/dev/null)
+  say "API: ${message:-no recovery.policy event found}"
   check "the demo's short leases are in effect (10 s lease, 3 s heartbeats, 1 s sweeps)" \
-    grep -q 'every 1.0 s .*leases last 10.0 s, heartbeats every 3.0 s' <<<"$policy"
+    jq -e '.leaseSeconds == 10 and .heartbeatIntervalSeconds == 3 and .sweepIntervalSeconds == 1' <<<"$policy"
 }
 
 stop_stack() {
@@ -112,6 +118,31 @@ container_of() {  # worker id -> container name
 print_attempts() {  # job id
   get "/jobs/$1/attempts" | jq -r '.attempts[] |
     "       attempt \(.attemptNumber): \(.status) on \(.workerId)\(if .errorType then " (" + .errorType + ")" else "" end)"'
+}
+
+# Whether the container's log has an accepted result for the job's attempt with this number.
+logged_result() {  # container, job id, attempt number
+  container_events "$1" | jq -e --argjson job "$2" --argjson n "$3" \
+    'select(.event.action == "result.accepted" and .jobId == $job and .attemptNumber == $n)' >/dev/null
+}
+
+# The frozen worker logged no result for attempt 1, while the same query finds attempt 2's in its
+# worker's log. Without that second half, a changed log format would pass this check unnoticed.
+reported_only_by_attempt_2() {  # frozen container, replacement's container, job id
+  ! logged_result "$1" "$3" 1 && logged_result "$2" "$3" 2
+}
+
+# Every log event about one job, from the API and all workers, in time order. API events carry
+# attempt ids; the claim events map them to attempt numbers.
+print_timeline() {  # job id
+  dc logs --no-log-prefix api worker 2>/dev/null | jq -n -r -R --argjson job "$1" '
+    def ts: ."@timestamp" | capture("^(?<s>[^.Z]+)(\\.(?<f>[0-9]+))?Z$") | .s + "." + ((.f // "") + "000000000")[0:9];
+    def pad($n): . + (" " * $n) | .[0:$n];
+    [inputs | fromjson? | select(.jobId == $job)] as $events
+    | ($events | map(select(.attemptNumber) | {key: .attemptId, value: .attemptNumber}) | from_entries) as $number
+    | $events | sort_by(ts)[]
+    | (if .service.name == "scheduler-api" then "api" else "worker \(.workerId)" end) as $source
+    | "       \(ts[11:23])  \($source | pad(23))\(.event.action | pad(20))attempt \($number[.attemptId // ""] // "-")"'
 }
 
 per_worker() {  # experiment id -> "workers: a1b2=67 c3d4=66 ..."
@@ -181,14 +212,15 @@ crash() {
 
 stale() {
   header "3. A stale worker: freeze one past its lease, then let it try to report"
-  local exp job worker frozen stale_attempt response before fenced="" deadline
+  local exp job worker frozen replacement stale_attempt response before fenced="" deadline
   exp=$(submit_long stale-demo)
   job=$(only_job "$exp")
   follow "$job" 30 '^RUNNING' || return
   worker=$(field "$job" .workerId)
   frozen=$(container_of "$worker")
-  # The API never hands attempt ids out through read endpoints; an operator can find them in its log.
-  stale_attempt=$(dc logs api 2>&1 | grep -oE "Claimed job $job attempt 1 \([0-9a-f-]{36}\)" | grep -oE '[0-9a-f-]{36}' | head -1)
+  # The API never hands attempt ids out through read endpoints; an operator finds them in its log.
+  stale_attempt=$(api_events | jq -r --argjson job "$job" \
+    'select(.event.action == "job.claimed" and .jobId == $job and .attemptNumber == 1) | .attemptId' | head -1)
   sleep 2
   docker pause "$frozen" >/dev/null
   say "docker pause $frozen: alive but frozen mid-training, like a long GC pause or a network partition"
@@ -209,10 +241,11 @@ stale() {
   say "docker unpause $frozen: it resumes attempt 1 and sends its next heartbeat"
   deadline=$((SECONDS + 20))
   while ((SECONDS < deadline)) && [ -z "$fenced" ]; do
-    fenced=$(docker logs "$frozen" 2>&1 | grep -m1 "job=$job attempt=1 lease lost")
+    fenced=$(container_events "$frozen" | jq -r --argjson job "$job" \
+      'select(.event.action == "lease.lost" and .jobId == $job and .attemptNumber == 1) | .message' | head -1)
     [ -z "$fenced" ] && sleep 0.5
   done
-  [ -n "$fenced" ] && say "frozen worker's log: ${fenced#*scheduler_worker.worker: }"
+  [ -n "$fenced" ] && say "frozen worker's log: $fenced"
   check "the woken worker learned it had lost the lease and stopped" test -n "$fenced"
 
   follow "$job" 90 '^(SUCCEEDED|FAILED)' || return
@@ -222,10 +255,13 @@ stale() {
   print_attempts "$job"
   check "the late stale report was rejected" jq -e '.status == 409' <<<"$response"
   check "the accepted result is attempt 2's, unchanged" test "$(get "/jobs/$job" | jq -c '{valAccuracy, result}')" = "$before"
-  check "the frozen worker never reported a result for attempt 1" \
-    bash -c "! docker logs '$frozen' 2>&1 | grep -q 'job=$job attempt=1 done'"
+  replacement=$(container_of "$(get "/jobs/$job/attempts" | jq -r '.attempts[1].workerId')")
+  check "the frozen worker never reported a result for attempt 1 (the same query finds attempt 2's)" \
+    reported_only_by_attempt_2 "$frozen" "$replacement" "$job"
   check "attempt 1 expired and attempt 2 succeeded" jq -e '[.attempts[].status] == ["EXPIRED", "SUCCEEDED"]' \
     <<<"$(get "/jobs/$job/attempts")"
+  say "the job's story, from the JSON logs of the API and all $WORKERS workers:"
+  print_timeline "$job"
 }
 
 # --- Main --------------------------------------------------------------------------------------

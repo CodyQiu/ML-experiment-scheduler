@@ -56,9 +56,17 @@ public class RecoveryService {
 			.toList();
 		for (int i = 0; i < expired.size(); i++) {
 			ExpiredLease lease = expired.get(i);
-			log.warn("Lease of job {} attempt {} ({}, worker {}) expired: job is now {} ({} of {} attempts used)",
-					lease.jobId(), lease.attemptNumber(), lease.attemptId(), lease.workerId(),
-					recovered.get(i).newState(), lease.attemptNumber(), lease.maxAttempts());
+			log.atWarn()
+				.addKeyValue("event.action", "lease.expired")
+				.addKeyValue("jobId", lease.jobId())
+				.addKeyValue("attemptNumber", lease.attemptNumber())
+				.addKeyValue("attemptId", lease.attemptId())
+				.addKeyValue("workerId", lease.workerId())
+				.addKeyValue("jobState", recovered.get(i).newState())
+				.addKeyValue("maxAttempts", lease.maxAttempts())
+				.log("Lease of job {} attempt {} ({}, worker {}) expired: job is now {} ({} of {} attempts used)",
+						lease.jobId(), lease.attemptNumber(), lease.attemptId(), lease.workerId(),
+						recovered.get(i).newState(), lease.attemptNumber(), lease.maxAttempts());
 		}
 		return recovered;
 	}

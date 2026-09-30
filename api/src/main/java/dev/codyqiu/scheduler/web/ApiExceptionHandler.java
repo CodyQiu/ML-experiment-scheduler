@@ -60,7 +60,7 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 
 	@ExceptionHandler(Exception.class)
 	ProblemDetail handleUnexpected(Exception ex) {
-		log.error("Unhandled exception", ex);
+		log.atError().addKeyValue("event.action", "request.failed").setCause(ex).log("Unhandled exception");
 		return problem(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Unexpected server error");
 	}
 

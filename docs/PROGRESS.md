@@ -1,6 +1,6 @@
 # Progress
 
-_Last updated: 2026-09-29_ (milestone 2 complete; 3.1 awaiting its first GitHub run)
+_Last updated: 2026-09-29_ (3.2 done; CI awaiting its first GitHub run)
 
 ## Status
 
@@ -12,7 +12,8 @@ _Last updated: 2026-09-29_ (milestone 2 complete; 3.1 awaiting its first GitHub 
 | 2.3 | Idempotent submission, safe repeated completion, best-configurations endpoint | done |
 | 2.4 | Scripted end-to-end demo with checks (`scripts/demo.sh`) | done |
 | 3.1 | CI (GitHub Actions): API tests, worker tests, and the checked demo on every push | built and replayed locally; not yet run on GitHub |
-| 3.2–3.4 | Structured logs, benchmarks, architecture README | next |
+| 3.2 | Structured logs: JSON lines with shared ids and event names from the API and workers | done |
+| 3.3–3.4 | Benchmarks, architecture README | next |
 
 ## Completed
 
@@ -45,8 +46,8 @@ _Last updated: 2026-09-29_ (milestone 2 complete; 3.1 awaiting its first GitHub 
   successful renewal stops training at the next minibatch.
 - **`CLAUDE.md`:** commands, architecture rules, testing conventions, and environment gotchas.
 
-Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3 as `eefcd0e`, and 2.4
-as `b62e554`.
+Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3 as `eefcd0e`, 2.4 as
+`b62e554`, and 3.1 as `ba836a9`.
 
 **2.2**
 
@@ -118,7 +119,51 @@ as `b62e554`.
     headroom.
 - **`CLAUDE.md`:** the CI commands, and the rules for keeping versions in sync with the images.
 
+**3.2**
+
+- **API:** every log call adds `event.action` and its ids as SLF4J key-value pairs.
+  `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs` in `compose.yaml` turns them into Spring Boot's ECS JSON.
+  A new `experiment.created` event logs each submission.
+- **Worker:** `scheduler_worker/logs.py` is a stdlib JSON formatter with the same shape, switched on
+  by `LOG_FORMAT=json`.
+  - `AttemptLog` prefixes each line with `job=N attempt=M` and attaches the attempt's ids to it.
+  - Every line carries `service.name` and `workerId`.
+- **`scripts/demo.sh`** reads events instead of grepping text, in four places: the policy, the stale
+  attempt's id, the fencing, and the "never reported" check. That check now also requires the same
+  query to find attempt 2's result.
+  - The stale scenario ends by printing the job's timeline, built from the JSON logs of the API and
+    all workers.
+- **Docs:** the field and event catalog, and query recipes, are in DESIGN.md ("Logs") and the
+  README. CLAUDE.md now treats logs as an interface.
+
 ## Verified (2026-09-29: macOS arm64, Docker Desktop 29.2.0)
+
+**3.2:**
+
+- **API:** `scripts/mvnw-docker.sh verify` ran 149 tests, 0 failures. `StructuredLogTests` (7) is new:
+  it renders events captured from real calls through Boot's ECS encoder, and checks their fields and
+  types.
+- **Worker:** `uv run pytest` ran 69 tests, 0 failures. There are new tests of the JSON lines, of
+  `AttemptLog`, of `LOG_FORMAT`, and of the events of a run and of a lost lease.
+- **Mutation checks, each caught:**
+  - `job.claimed` without `attemptId`;
+  - the rejection `code` logged as the job state;
+  - `AttemptLog` dropping per-call fields;
+  - dotted names not nested;
+  - `lease.lost` without its `event.action`.
+- **Demo:** `scripts/demo.sh` passed 17/17. The printed timeline for the stale job showed, in order:
+  1. claim, then training;
+  2. `lease.expired`, then attempt 2's claim 0.12 s later;
+  3. the stale `result.rejected`, the frozen worker's `heartbeat.rejected`, and its `lease.lost`;
+  4. attempt 2's `result.accepted`, from both sides;
+  5. the late `result.rejected`.
+- **Negative check:** with the workers switched back to `LOG_FORMAT=text`, `scripts/demo.sh stale`
+  exited 1. Both worker-log checks failed, including the "never reported" check, which would
+  previously have passed.
+- **Live:** the README's recipes were run on a scratch stack. With PostgreSQL stopped under the
+  API, a request got `500`, and `request.failed` carried `error.type`
+  (`CannotGetJdbcConnectionException`) and the stack trace.
+- **Not re-run for 3.2:** the CI replays. The CI jobs' commands did not change.
 
 **3.1, replayed locally; not yet run on GitHub.** Each job's `run:` steps were extracted from
 `ci.yml` and run with `bash --noprofile --norc -eo pipefail`, as `shell: bash` does on the runner.
@@ -297,23 +342,18 @@ as `b62e554`.
 - **Not everything in CI is pinned by content:**
   - images are pinned by version tag, not digest;
   - Maven and its dependencies are trusted over TLS (see DESIGN.md, Continuous integration).
+- **Logs stay in Docker.** Nothing ships, retains, or indexes them. `docker compose logs` plus
+  `jq` is the query tool, and removing a container removes its logs.
 - **Other:** bodies parsed before size limits, no local JDK.
 
 ## Next: the rest of milestone 3 (evidence and polish)
 
 1. **The first CI run:** push `milestone-2`, then check the three jobs and the demo's summary in the
    Actions tab. Runner timings go here as observations, not benchmarks.
-2. **3.2 Structured logs:** JSON logs from the API (Spring Boot's structured logging) and the
-   worker, carrying `experimentId`, `jobId`, `attemptNumber`/`attemptId`, and `workerId` as fields.
-   - `scripts/demo.sh` greps four log lines, so it must change along with the format:
-     - the API's `Recovering expired leases every …` and `Claimed job … attempt 1 (…)`;
-     - the worker's `job=… attempt=1 lease lost` and `job=… attempt=1 done`.
-   - CI would catch a stale pattern for the first three, whose checks would fail. The last one
-     must be absent, so a stale pattern would pass without a word.
-3. **3.3 Benchmark:**
+2. **3.3 Benchmark:**
    - `scripts/benchmark.sh` measures API latency (claim, complete, submit) separately from training
      throughput at 1, 2, and 4 workers;
    - it records the hardware, CPU limits, batch, and warm-up;
    - a results template holds observed numbers only.
-4. **3.4 Architecture README:** the one-page architecture, how to run the demo, and what each
+3. **3.4 Architecture README:** the one-page architecture, how to run the demo, and what each
    guarantee rests on.

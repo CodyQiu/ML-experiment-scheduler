@@ -6,6 +6,7 @@ import dev.codyqiu.scheduler.job.JobRepository;
 import dev.codyqiu.scheduler.web.NotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.spi.LoggingEventBuilder;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -59,16 +60,33 @@ public class ExperimentService {
 				fingerprint);
 		if (inserted.isPresent()) {
 			jobs.insertAll(inserted.get(), maxAttempts, request.jobs());
+			LoggingEventBuilder created = log.atInfo()
+				.addKeyValue("event.action", "experiment.created")
+				.addKeyValue("experimentId", inserted.get())
+				.addKeyValue("jobCount", request.jobs().size())
+				.addKeyValue("maxAttempts", maxAttempts);
+			if (idempotencyKey != null) {
+				created.addKeyValue("idempotencyKey", idempotencyKey);
+			}
+			created.log("Created experiment {} with {} jobs", inserted.get(), request.jobs().size());
 			return new Submission.Created(experiments.findWithProgress(inserted.get()).orElseThrow());
 		}
 		StoredKey stored = experiments.findByIdempotencyKey(idempotencyKey).orElseThrow();
 		if (!stored.fingerprint().equals(fingerprint)) {
-			log.warn("Idempotency-Key {} reused for a different request (it belongs to experiment {})", idempotencyKey,
-					stored.experimentId());
+			log.atWarn()
+				.addKeyValue("event.action", "submission.key_reused")
+				.addKeyValue("experimentId", stored.experimentId())
+				.addKeyValue("idempotencyKey", idempotencyKey)
+				.log("Idempotency-Key {} reused for a different request (it belongs to experiment {})",
+						idempotencyKey, stored.experimentId());
 			return new Submission.KeyReused(stored.experimentId());
 		}
-		log.info("Idempotency-Key {} replayed: returning experiment {} without creating anything", idempotencyKey,
-				stored.experimentId());
+		log.atInfo()
+			.addKeyValue("event.action", "submission.replayed")
+			.addKeyValue("experimentId", stored.experimentId())
+			.addKeyValue("idempotencyKey", idempotencyKey)
+			.log("Idempotency-Key {} replayed: returning experiment {} without creating anything", idempotencyKey,
+					stored.experimentId());
 		return new Submission.Replayed(experiments.findWithProgress(stored.experimentId()).orElseThrow());
 	}
 

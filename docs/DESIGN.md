@@ -815,6 +815,76 @@ A shutdown still consumes an attempt from the budget, like any other execution t
 Giving it back would mean reusing an attempt number, which `attempts_job_attempt_number_unique`
 forbids.
 
+## Logs
+
+In the Compose stack both services log one JSON object per line: the API through
+`LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`, and the workers through `LOG_FORMAT=json`. Run anywhere
+else (an IDE, the tests, `uv run`), they log text.
+
+**The shape** is Spring Boot's Elastic Common Schema (ECS) format, which the worker reproduces with
+a small stdlib formatter (`worker/scheduler_worker/logs.py`):
+
+- `@timestamp` (UTC), `log.level` (with Logback's names: `WARN`, not `WARNING`), `log.logger`,
+  `process.pid`, `process.thread.name`, `service.name` (`scheduler-api` or `scheduler-worker`),
+  `message`, and `ecs.version`;
+- `error.type`, `error.message`, and `error.stack_trace` when an exception is logged;
+- each event's own fields at the top level, with the same names on both sides.
+
+| Field | Meaning |
+|---|---|
+| `event.action` | A stable name for what happened (below). Messages are for people and may change; queries and `scripts/demo.sh` use this |
+| `experimentId`, `jobId`, `attemptNumber`, `attemptId`, `workerId` | The ids, typed as in the API's JSON: numbers, and strings for attempt and worker ids |
+| `code`, `jobState` | On a rejection: the same values as the `409` response's |
+| Others | Specific to the event: `errorType`, `retryable`, `valAccuracy`, `maxAttempts`, `leaseSeconds`, … |
+
+**Events.** Where both sides log one, they describe the same fact, and `service.name` says whose
+view it is.
+
+| `event.action` | Logged by | Other fields, or what it means |
+|---|---|---|
+| `experiment.created` | API | `jobCount`, `maxAttempts`, `idempotencyKey` (only if one was sent) |
+| `submission.replayed`, `submission.key_reused` | API | `idempotencyKey` |
+| `job.claimed` | API | the attempt's ids and `workerId` |
+| `training.started` | worker | `seed` |
+| `heartbeat.rejected` | API | `code`, `jobState` |
+| `heartbeat.failed` | worker | a transient failure; the thread tries again |
+| `lease.lost` | worker | `reason`: a rejected renewal, or a full lease without one |
+| `lease.expired` | API | `workerId`, `jobState` (`QUEUED` or `FAILED`), `maxAttempts` |
+| `result.accepted` | both | `valAccuracy`; the worker adds `valLoss`, `trainingSeconds`, `replayed` |
+| `result.replayed` | API | an identical repeat of the accepted report |
+| `result.rejected`, `failure.rejected` | both | `code`, `jobState` |
+| `result.undeliverable`, `failure.undeliverable` | worker | the report failed after its retries |
+| `failure.recorded` | both | `errorType`, `retryable`, `jobState`; the API adds `maxAttempts` |
+| `recovery.policy` | API | `sweepIntervalSeconds`, `batchSize`, `leaseSeconds`, `heartbeatIntervalSeconds` |
+| `request.failed` | API | an unhandled exception, with `error.*` |
+| `worker.configured`, `worker.started`, `worker.stopped`, `claim.failed`, `request.retrying`, `training.error`, `assignment.unusable` | worker | the worker's own lifecycle and troubles |
+
+- **Each event carries the ids its code path already has.** Logging never costs a query. The
+  API's report events have `attemptId` but not `attemptNumber`. Its `job.claimed` event maps one to
+  the other, which is how the demo's timeline labels attempts.
+- **Events are logged inside the transaction that makes the change.** If the commit then failed,
+  the line would describe a change that was rolled back, and the error would follow it.
+- **Timestamps differ in precision.** The API prints up to 9 fractional digits and the worker 6,
+  so pad the fractions before sorting the strings.
+- **Attempt ids appear in logs,** which only operators read, and never in read endpoints.
+- **Tested three ways:**
+  - `StructuredLogTests` renders real events through Boot's ECS encoder;
+  - `test_logs.py` checks the worker's lines;
+  - `scripts/demo.sh` reads four events and fails when they are missing. With the workers switched
+    back to text logs, the `stale` scenario failed both of its worker-log checks.
+
+Reading them:
+
+```bash
+# The messages alone
+docker compose logs --no-log-prefix worker | jq -R -r 'fromjson? | .message'
+# One job's story across the API and every worker
+docker compose logs --no-log-prefix api worker | jq -R -r 'fromjson? | select(.jobId == 1)
+  | [."@timestamp", .service.name, .event.action, .message] | @tsv' | sort
+```
+
+`fromjson?` skips any line that isn't JSON, such as a stop signal's notice on a worker's stderr.
+
 ## Continuous integration (`.github/workflows/ci.yml`)
 
 Every push starts three independent jobs, each on a fresh GitHub-hosted `ubuntu-24.04` x86_64 runner.
@@ -923,3 +993,9 @@ demand, from the Actions tab once the workflow is on `main`.
 | CI installs with `uv sync --locked`; the image uses `--frozen` | CI must fail on a stale lock. The image must install exactly what the lock says |
 | The Dockerfile frontend is pinned (`docker/dockerfile:1.26.0`) | `:1` is a moving tag, so a build could change without a commit. On 2026-09-29 it still resolved to 1.26.0, although 1.27.0 was released on 2026-09-02 |
 | `e2e` builds the images in a step of their own | The build log stays visible, and the demo's `up --build` then only reuses layers |
+| Logs use Spring Boot's built-in ECS format, and the worker reproduces it | No dependency or custom encoder in the API. One query language covers both services |
+| Queries match `event.action`, not message text | Messages are for people. Rewording one must not break a query or the demo |
+| JSON logs only in the Compose stack | IDE and test output stays readable. The stack is what gets operated and queried |
+| Log fields come from SLF4J's fluent API (`addKeyValue`), not the MDC | The ids are known at the call site. The MDC would need scoping across threads (the heartbeat) and request lifecycles |
+| The worker's JSON formatter uses only the standard library | No new dependency in the locked environment |
+| The demo's "never reported" check has a positive control | A check that only asserts an absence passes silently once the format changes. The same query must find attempt 2's result |

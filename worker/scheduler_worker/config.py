@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from . import logs
+
 TASK_ID = "synthetic-mlp-v1"
 OPTIMIZERS = ("sgd", "adam")
 WORKER_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -113,6 +115,7 @@ class WorkerSettings:
     read_timeout_seconds: float
     report_attempts: int
     torch_threads: int
+    log_format: str = "text"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "WorkerSettings":
@@ -128,6 +131,7 @@ class WorkerSettings:
             read_timeout_seconds=_env_float(env, "HTTP_READ_TIMEOUT_SECONDS", 10.0),
             report_attempts=_env_int(env, "REPORT_ATTEMPTS", 5),
             torch_threads=_env_int(env, "TORCH_NUM_THREADS", 1),
+            log_format=_env_choice(env, "LOG_FORMAT", logs.FORMATS),
         )
 
 
@@ -155,6 +159,14 @@ def _number(data: Mapping[str, Any], key: str, low: float, high: float) -> float
     if not low <= value <= high:
         raise InvalidAssignment(f"{key} must be between {low} and {high}, got {value}")
     return float(value)
+
+
+def _env_choice(env: Mapping[str, str], key: str, choices: tuple[str, ...]) -> str:
+    """The variable's value, which must be one of `choices`; the first choice is the default."""
+    value = env.get(key, choices[0])
+    if value not in choices:
+        raise ValueError(f"{key} must be one of {list(choices)}, got {value!r}")
+    return value
 
 
 def _env_float(env: Mapping[str, str], key: str, default: float) -> float:

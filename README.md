@@ -7,9 +7,13 @@ bounded retries, and idempotent submission, all backed by PostgreSQL.
 
 **Status:** milestones 1 (end-to-end MVP) and 2 (reliability) are complete. That covers atomic
 claims, leases and heartbeats, crash recovery, failure reports with bounded retries, idempotent
-submission, safe repeated completion, and a checked end-to-end demo. Milestone 3 has begun: a CI
-workflow that runs both test suites and the demo on every push is in place, replayed locally but not
-yet run on GitHub. Structured logs and benchmarks are next.
+submission, safe repeated completion, and a checked end-to-end demo. Milestone 3 has begun:
+
+- A CI workflow runs both test suites and the demo on every push. It was replayed locally but has
+  not yet run on GitHub.
+- Both services log JSON lines that share ids and event names.
+
+Benchmarks are next.
 
 ## See it handle failure
 
@@ -50,7 +54,10 @@ while sleep 1; do curl -s localhost:8080/experiments/$ID | jq -c .progress; done
 curl -s "localhost:8080/experiments/$ID/best?limit=5" | jq -r '.jobs[] |
   "#\(.rank) \(.valAccuracy)  \(.config.optimizer) lr=\(.config.learningRate) \(.config.hiddenUnits)x\(.config.hiddenLayers)"'
 
-docker compose logs worker              # claim → train → report, one line each
+# Logs are JSON lines (see docs/DESIGN.md, "Logs"): the messages, then job 1's story across services
+docker compose logs --no-log-prefix worker | jq -R -r 'fromjson? | .message'
+docker compose logs --no-log-prefix api worker | jq -R -r 'fromjson? | select(.jobId == 1)
+  | [."@timestamp", .service.name, .event.action, .message] | @tsv' | sort
 
 # Failures at a glance, and one job's full history
 curl -s localhost:8080/experiments/$ID/jobs | jq -c '.jobs[] | select(.lastError) | {id, state, lastError}'
@@ -74,7 +81,9 @@ curl -s -X POST localhost:8080/experiments -H 'Content-Type: application/json' -
   "jobs":[{"seed":0,"config":{"learningRate":0.01,"hiddenUnits":256,"hiddenLayers":4,"batchSize":8,"epochs":100,"optimizer":"adam","weightDecay":0.0}}]}' | jq .id
 curl -s localhost:8080/experiments/<id>/jobs | jq '.jobs[0] | {id, state, workerId}'   # note the workerId prefix
 docker kill -s KILL <worker container whose ID starts with that prefix>   # see: docker compose ps worker
-docker compose logs -f api | grep -E 'Claimed|expired|Accepted'           # attempt 1 expires, attempt 2 wins
+# Attempt 1 expires, and attempt 2 wins
+docker compose logs -f --no-log-prefix api | jq -R -r 'fromjson?
+  | select(.event.action | IN("job.claimed", "lease.expired", "result.accepted")) | .message'
 ```
 
 **Stopping.**

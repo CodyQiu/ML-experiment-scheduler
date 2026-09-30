@@ -38,9 +38,15 @@ public class RecoverySweeper implements SchedulingConfigurer {
 	@Override
 	public void configureTasks(ScheduledTaskRegistrar registrar) {
 		Duration interval = properties.recovery().sweepInterval();
-		log.info("Recovering expired leases every {} s in batches of {} (leases last {} s, heartbeats every {} s)",
-				seconds(interval), properties.recovery().batchSize(), properties.lease().durationSeconds(),
-				properties.lease().heartbeatIntervalSeconds());
+		log.atInfo()
+			.addKeyValue("event.action", "recovery.policy")
+			.addKeyValue("sweepIntervalSeconds", seconds(interval))
+			.addKeyValue("batchSize", properties.recovery().batchSize())
+			.addKeyValue("leaseSeconds", properties.lease().durationSeconds())
+			.addKeyValue("heartbeatIntervalSeconds", properties.lease().heartbeatIntervalSeconds())
+			.log("Recovering expired leases every {} s in batches of {} (leases last {} s, heartbeats every {} s)",
+					seconds(interval), properties.recovery().batchSize(), properties.lease().durationSeconds(),
+					properties.lease().heartbeatIntervalSeconds());
 		registrar.addFixedDelayTask(this::sweep, interval);
 	}
 

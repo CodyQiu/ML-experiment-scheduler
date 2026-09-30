@@ -29,6 +29,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/scheduler
       SPRING_DATASOURCE_USERNAME: scheduler
       SPRING_DATASOURCE_PASSWORD: scheduler
+      # One JSON object per line, in Spring Boot's Elastic Common Schema format (see docs/DESIGN.md).
+      LOGGING_STRUCTURED_FORMAT_CONSOLE: ecs
     ports:
       - "127.0.0.1:${API_PORT:-8080}:8080"
     depends_on:
@@ -45,6 +47,8 @@ services:
     build: ./worker
     environment:
       SCHEDULER_API_URL: http://api:8080
+      # The same JSON shape as the API's, so one query follows a job through both.
+      LOG_FORMAT: json
     depends_on:
       api:
         condition: service_healthy

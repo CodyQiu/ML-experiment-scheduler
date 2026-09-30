@@ -121,7 +121,7 @@ class ApiClient:
             if attempt < attempts:
                 delay = backoff.next()
                 log.warning("POST %s attempt %d/%d failed (%s); retrying in %.1fs", path, attempt, attempts,
-                            failure, delay)
+                            failure, delay, extra={"event.action": "request.retrying", "path": path})
                 self._sleep(delay)
         raise ApiUnavailable(f"POST {path} failed after {attempts} attempt(s): {failure}")
 

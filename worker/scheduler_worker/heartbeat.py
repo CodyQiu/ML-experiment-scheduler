@@ -62,7 +62,9 @@ class Heartbeat:
                 if silent_for >= self._lease_seconds:
                     self._lose(f"no heartbeat succeeded for {silent_for:.1f}s, a full lease")
                     return
-                log.warning("job=%d heartbeat failed (%s); retrying in %.1fs", self._job_id, exc, self._interval)
+                log.warning("job=%d heartbeat failed (%s); retrying in %.1fs", self._job_id, exc, self._interval,
+                            extra={"event.action": "heartbeat.failed", "jobId": self._job_id,
+                                   "attemptId": str(self._attempt_id)})
                 continue
             self._last_renewal = self._clock()
 

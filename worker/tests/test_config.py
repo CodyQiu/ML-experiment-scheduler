@@ -81,13 +81,16 @@ def test_settings_come_from_the_environment():
     assert settings.poll_max_seconds == 2.0
     assert settings.report_attempts == 3
     assert settings.torch_threads == 1
+    assert settings.log_format == "text"
+    assert WorkerSettings.from_env({"LOG_FORMAT": "json"}).log_format == "json"
 
 
 def test_default_worker_id_is_accepted_by_the_api():
     assert WorkerSettings.from_env({}).worker_id == default_worker_id()
 
 
-@pytest.mark.parametrize("env", [{"WORKER_ID": "has space"}, {"POLL_MAX_SECONDS": "0"}, {"TORCH_NUM_THREADS": "0"}])
+@pytest.mark.parametrize("env", [{"WORKER_ID": "has space"}, {"POLL_MAX_SECONDS": "0"}, {"TORCH_NUM_THREADS": "0"},
+                                 {"LOG_FORMAT": "xml"}])
 def test_rejects_invalid_settings(env):
     with pytest.raises(ValueError):
         WorkerSettings.from_env(env)
