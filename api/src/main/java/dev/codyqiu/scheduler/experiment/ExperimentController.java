@@ -56,6 +56,12 @@ public class ExperimentController {
 		};
 	}
 
+	/** The newest experiments first, with their progress; {@code limit} is 1–100 (default 20). */
+	@GetMapping
+	public ExperimentListResponse list(@RequestParam(defaultValue = "20") @Min(1) @Max(100) int limit) {
+		return experiments.listRecent(limit);
+	}
+
 	@GetMapping("/{id}")
 	public ExperimentResponse get(@PathVariable long id) {
 		return experiments.get(id);

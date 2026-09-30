@@ -1,6 +1,9 @@
 package dev.codyqiu.scheduler.experiment;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Optional;
 
 import dev.codyqiu.scheduler.experiment.ExperimentResponse.Progress;
@@ -75,15 +78,38 @@ public class ExperimentRepository {
 				GROUP BY e.id
 				""")
 			.param("id", id)
-			.query((rs, rowNum) -> new ExperimentResponse(
-					rs.getLong("id"),
-					rs.getString("name"),
-					Task.fromId(rs.getString("task")),
-					rs.getInt("max_attempts"),
-					rs.getObject("created_at", OffsetDateTime.class).toInstant(),
-					new Progress(rs.getInt("total"), rs.getInt("queued"), rs.getInt("running"),
-							rs.getInt("succeeded"), rs.getInt("failed"))))
+			.query(ExperimentRepository::withProgress)
 			.optional();
+	}
+
+	/** The newest experiments first, each with its progress, all from one statement's snapshot. */
+	public List<ExperimentResponse> findRecentWithProgress(int limit) {
+		return jdbc.sql("""
+				SELECT e.id, e.name, e.task, e.max_attempts, e.created_at,
+				       count(j.id)                                     AS total,
+				       count(j.id) FILTER (WHERE j.state = 'QUEUED')    AS queued,
+				       count(j.id) FILTER (WHERE j.state = 'RUNNING')   AS running,
+				       count(j.id) FILTER (WHERE j.state = 'SUCCEEDED') AS succeeded,
+				       count(j.id) FILTER (WHERE j.state = 'FAILED')    AS failed
+				FROM (SELECT * FROM experiments ORDER BY id DESC LIMIT :limit) e
+				LEFT JOIN jobs j ON j.experiment_id = e.id
+				GROUP BY e.id, e.name, e.task, e.max_attempts, e.created_at
+				ORDER BY e.id DESC
+				""")
+			.param("limit", limit)
+			.query(ExperimentRepository::withProgress)
+			.list();
+	}
+
+	private static ExperimentResponse withProgress(ResultSet rs, int rowNum) throws SQLException {
+		return new ExperimentResponse(
+				rs.getLong("id"),
+				rs.getString("name"),
+				Task.fromId(rs.getString("task")),
+				rs.getInt("max_attempts"),
+				rs.getObject("created_at", OffsetDateTime.class).toInstant(),
+				new Progress(rs.getInt("total"), rs.getInt("queued"), rs.getInt("running"), rs.getInt("succeeded"),
+						rs.getInt("failed")));
 	}
 
 	public boolean exists(long id) {

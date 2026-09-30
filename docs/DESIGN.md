@@ -202,6 +202,7 @@ accepted result can never be overwritten.
 | `POST /worker/jobs/{id}/fail` | Report a failure | `200` with the new state | `400`, `404`, `409` | implemented |
 | `GET /jobs/{id}/attempts` | Attempt history | `200` | `404` | implemented |
 | `GET /experiments/{id}/best?limit=N` | Top successful jobs by `valAccuracy` | `200` | `400`, `404` | implemented |
+| `GET /experiments?limit=N` | The newest experiments first, with progress | `200` | `400` | implemented |
 
 ### `POST /experiments`
 
@@ -287,6 +288,20 @@ The mechanism is described under [Transactions, locking, and time](#transactions
   field `limit`.
 - An experiment has at most 500 jobs, so the sort reads them through the experiment's index and
   needs no index of its own.
+
+### `GET /experiments`
+
+```json
+{"experiments": [{"id": 2, "name": "small-lr-width-sweep", "task": "synthetic-mlp-v1", "maxAttempts": 3,
+  "createdAt": "…", "progress": {"total": 6, "queued": 0, "running": 0, "succeeded": 6, "failed": 0}}]}
+```
+
+- It lists the newest experiments first, each exactly as `GET /experiments/{id}` shows it.
+- `limit` is 1–100, default 20. A value outside that range returns `400 VALIDATION_FAILED` with
+  field `limit`.
+- One statement reads every count, so they agree with each other, as for a single experiment.
+- `./sched` uses the first entry as "the latest experiment", so the CLI keeps no state of its
+  own.
 
 ### `GET /experiments/{id}/jobs` and `GET /jobs/{id}`
 
@@ -1004,6 +1019,8 @@ demand, from the Actions tab once the workflow is on `main`.
 | The demo's "never reported" check has a positive control | A check that only asserts an absence passes silently once the format changes. The same query must find attempt 2's result |
 | Dispatch is benchmarked with fake workers that never train (`docs/BENCHMARKS.md`) | It separates the scheduler's own cost per job from training |
 | The benchmark's client runs inside the Compose network, one process per fake worker | Otherwise macOS port forwarding would be measured. In a trial run, one process's interpreter lock capped the client at 16 fake workers |
+| A command-line tool (`./sched`) in standard-library Python 3.9 | Short commands for the whole lifecycle, with no install step: macOS and most Linux systems already have Python 3.9 |
+| `GET /experiments` lists the newest experiments | The CLI defaults to the latest experiment without keeping state, so it stays right after a restart or from another terminal |
 | Every benchmark run checks that each job was claimed and completed exactly once | Numbers from a run that broke correctness would describe the wrong system. Under load, the check doubles as a concurrency test |
 | Benchmark CPU comes from cgroup counters read before and after | They are exact, and cost nothing while the measurement runs, unlike sampling `docker stats` |
 | Benchmark repetitions are interleaved by round | Drift during a long run, from heat or background load, affects every level alike |

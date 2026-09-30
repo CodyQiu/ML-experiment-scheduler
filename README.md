@@ -1,155 +1,200 @@
 # ML Experiment Scheduler
 
-Submit a batch of small ML training configurations over REST. Python workers claim the jobs, train
-a small CPU-only PyTorch model on a deterministic synthetic dataset, and report metrics. The
-project is about correctness under concurrency and failure: atomic claims, leases, fencing tokens,
-bounded retries, and idempotent submission, all backed by PostgreSQL.
+Run hyperparameter sweeps on a pool of workers, and get the best configurations back. The
+scheduler stays correct when workers crash, freeze, or report twice.
 
-**Status:** milestones 1 (end-to-end MVP) and 2 (reliability) are complete. That covers atomic
-claims, leases and heartbeats, crash recovery, failure reports with bounded retries, idempotent
-submission, safe repeated completion, and a checked end-to-end demo. Milestone 3 has begun:
-
-- A CI workflow runs both test suites and the demo on every push. It was replayed locally but has
-  not yet run on GitHub.
-- Both services log JSON lines that share ids and event names.
-- `scripts/benchmark.sh` measures dispatch, submission, and training throughput, and checks
-  correctness while it does. The observed numbers and the method are in
-  [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-
-The architecture README is next.
-
-## See it handle failure
-
-```bash
-scripts/demo.sh    # about 100 s; needs Docker, jq, curl, python3
-```
-
-It runs in its own Compose project, with API on `:18080` and 10 s leases, so it never touches the
-stack below. It walks through:
-
-1. a 200-configuration sweep shared by 3 workers, then the best configurations;
-2. a worker SIGKILLed mid-training, whose job another worker finishes after the lease expires;
-3. a worker frozen past its lease, whose old attempt then tries to report: rejected while its
-   replacement runs, rejected again after it succeeds, and the worker itself is fenced when it
-   wakes.
-
-Every claim is checked (`[ok]`/`[FAIL]`), and the exit status is non-zero on any violation.
-`scripts/demo.sh crash stale` runs only some scenarios, and `KEEP=1` leaves the stack up to
-explore. See
-[docs/PROGRESS.md](docs/PROGRESS.md) and [docs/DESIGN.md](docs/DESIGN.md).
+- You submit a batch of training configurations.
+- Workers claim them, train a small PyTorch model on CPU, and report metrics.
+- PostgreSQL keeps track of everything.
 
 ## Quick start
 
-Requires Docker with Compose v2 and `jq`. A local JDK or Python is optional.
+You need Docker (running) and Python 3.9 or later, which macOS and most Linux systems already have.
 
 ```bash
-docker compose up -d --build --wait     # PostgreSQL 18, the API on localhost:8080, one worker
-
-# Submit six configs and keep the new experiment's id. With an Idempotency-Key, a retry of this
-# exact request returns the same experiment instead of creating another one.
-ID=$(curl -s -X POST localhost:8080/experiments -H 'Content-Type: application/json' \
-       -H 'Idempotency-Key: quickstart-1' --data @examples/small-batch.json | jq .id)
-
-# Watch progress until every job has finished (a few seconds; Ctrl-C to quit)
-while sleep 1; do curl -s localhost:8080/experiments/$ID | jq -c .progress; done
-
-# Compare the successful configurations, best first
-curl -s "localhost:8080/experiments/$ID/best?limit=5" | jq -r '.jobs[] |
-  "#\(.rank) \(.valAccuracy)  \(.config.optimizer) lr=\(.config.learningRate) \(.config.hiddenUnits)x\(.config.hiddenLayers)"'
-
-# Logs are JSON lines (see docs/DESIGN.md, "Logs"): the messages, then job 1's story across services
-docker compose logs --no-log-prefix worker | jq -R -r 'fromjson? | .message'
-docker compose logs --no-log-prefix api worker | jq -R -r 'fromjson? | select(.jobId == 1)
-  | [."@timestamp", .service.name, .event.action, .message] | @tsv' | sort
-
-# Failures at a glance, and one job's full history
-curl -s localhost:8080/experiments/$ID/jobs | jq -c '.jobs[] | select(.lastError) | {id, state, lastError}'
-curl -s localhost:8080/jobs/1/attempts | jq
+./sched start      # start the scheduler: PostgreSQL, the API, and 2 workers
+./sched sweep      # submit a sweep: 100 training configurations
+./sched watch      # follow it live; it shows the best results when it finishes
+./sched stop       # stop everything (your data is kept)
 ```
 
-**More workers and a bigger batch.** This runs the 100-config grid; add `--seeds 2` for 200 jobs.
+The first `start` builds the images, which takes a few minutes. After that it takes seconds.
+
+```
+$ ./sched best -n 3
+RANK  VAL ACCURACY  CONFIG                                  SEED  JOB
+1     0.995         adam lr=0.03 128x1 batch=64 epochs=20   0     77
+2     0.995         adam lr=0.1 64x1 batch=64 epochs=20     0     93
+3     0.993         adam lr=0.003 128x2 batch=64 epochs=20  0     39
+```
+
+## See it survive failures
 
 ```bash
-docker compose up -d --scale worker=3 --wait
-python3 scripts/make_sweep.py | curl -s -X POST localhost:8080/experiments \
-  -H 'Content-Type: application/json' --data @- | jq '{id, progress}'
+./sched demo       # about 100 s; also needs jq (brew install jq)
 ```
 
-**Crash recovery.** Kill a worker mid-job. After its 30 s lease expires, the sweep re-queues the job
-and another worker runs attempt 2:
+The demo runs a separate copy of the scheduler with short leases, so it never touches your data.
+It then breaks things on purpose:
 
-```bash
-docker compose up -d --scale worker=2 --wait
-curl -s -X POST localhost:8080/experiments -H 'Content-Type: application/json' -d '{"name":"crash","task":"synthetic-mlp-v1",
-  "jobs":[{"seed":0,"config":{"learningRate":0.01,"hiddenUnits":256,"hiddenLayers":4,"batchSize":8,"epochs":100,"optimizer":"adam","weightDecay":0.0}}]}' | jq .id
-curl -s localhost:8080/experiments/<id>/jobs | jq '.jobs[0] | {id, state, workerId}'   # note the workerId prefix
-docker kill -s KILL <worker container whose ID starts with that prefix>   # see: docker compose ps worker
-# Attempt 1 expires, and attempt 2 wins
-docker compose logs -f --no-log-prefix api | jq -R -r 'fromjson?
-  | select(.event.action | IN("job.claimed", "lease.expired", "result.accepted")) | .message'
+1. it shares a 200-configuration sweep among 3 workers;
+2. it kills a worker in the middle of training, and another worker finishes the job;
+3. it freezes a worker past its deadline and lets it try to report. Its stale result is rejected,
+   the worker is stopped when it wakes, and the job's whole story is printed from the logs.
+
+Every claim is checked, and the demo exits with an error if any check fails.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `./sched start [--workers N]` | Starts PostgreSQL, the API, and N workers (default 2) |
+| `./sched workers N` | Changes how many workers run |
+| `./sched sweep [--seeds N]` | Submits the built-in grid: 100 configurations, each run with N seeds |
+| `./sched submit FILE` | Submits your own batch from a JSON file; see [`examples/small-batch.json`](examples/small-batch.json) |
+| `./sched list` | Shows recent experiments and their progress |
+| `./sched status [ID]` | Shows an experiment's progress |
+| `./sched watch [ID]` | Follows an experiment until it finishes, then shows the best results |
+| `./sched best [ID] [-n N]` | Shows the best configurations |
+| `./sched jobs [ID] [--failed]` | Shows every job of an experiment, or only the ones that failed |
+| `./sched job JOB_ID` | Shows one job and every attempt to run it |
+| `./sched logs [-f] [--job ID]` | Shows readable logs from the API and the workers |
+| `./sched stop [--delete-data]` | Stops everything. The data is kept unless you ask |
+| `./sched test` | Runs the test suites (needs only Docker) |
+| `./sched bench` | Measures throughput and latency, in about 7 minutes |
+
+`ID` defaults to the latest experiment, and `./sched COMMAND -h` shows a command's options.
+
+## How it works
+
+```
+ you: ./sched, or any HTTP client               worker × N (Python 3.14, PyTorch on CPU)
+        │ submit, check progress                       │ claim → heartbeat → report
+        ▼                                              ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ API: Java 21, Spring Boot 4.1                                    │
+ │ validation · guarded state transitions · leases · recovery sweep │
+ └────────────────────────────────┬─────────────────────────────────┘
+                                  │ JDBC: explicit SQL, short transactions
+                                  ▼
+                   PostgreSQL 18: experiments, jobs, attempts
 ```
 
-**Stopping.**
+- **The API is the database's only client.** Workers change state only through HTTP, and the API
+  turns each request into one guarded SQL statement.
+- **There is no message broker.** Workers poll for work, and row locks with
+  `FOR UPDATE SKIP LOCKED` make the `jobs` table a correct work queue.
+- **You submit configurations, not code.** Each job is a set of hyperparameters for one fixed task,
+  never a command.
+- **Every run of a job is an attempt with its own id.** Only the job's current attempt can change
+  it, so a stale worker can't overwrite anything.
 
-```bash
-docker compose stop worker    # each worker finishes and reports its current job, then exits
-docker compose down           # stop everything; add -v to also delete the database volume
+A job's life:
+
+```
+         claim: the lease starts            complete: current attempt, live lease
+ QUEUED ─────────────────────────▶ RUNNING ────────────────────────────────────▶ SUCCEEDED
+   ▲                                 │  │
+   │  lease expired, or a retryable  │  │  lease expired on the final attempt, a
+   └── failure, with attempts left ──┘  │  non-retryable failure, or a retryable one
+                                        │  on the final attempt
+                                        └──────────────────────────────────────▶ FAILED
 ```
 
-A rejected batch gets per-field errors, and nothing is stored:
+- **A claim is one SQL statement.** It locks the oldest queued job, marks it running under a new
+  attempt id, and starts a 30-second lease on the database's clock.
+- **While training, a worker renews its lease every 10 seconds.** If a renewal is refused, or none
+  succeeds for a whole lease, it stops at the next minibatch.
+- **Every change is one `UPDATE` guarded by the job's state, its attempt id, and a live lease.**
+  The number of rows it updated decides whether the change happened. A refused request gets a
+  `409` with a reason.
+- **The API sweeps for expired leases every 5 seconds.** An expired job goes back to the queue, or
+  fails once its attempts are used up.
+- **`SUCCEEDED` and `FAILED` are final.** No update applies to them, so an accepted result is
+  never replaced.
+
+## What it guarantees, and what each guarantee rests on
+
+| Guarantee | Rests on | Shown by |
+|---|---|---|
+| Two workers never both claim a job | The single-statement claim with `FOR UPDATE SKIP LOCKED`, and a unique index allowing one running attempt per job | `WorkerConcurrencyTests`; every benchmark run, with up to 16 concurrent claimers, checks it |
+| Only the current attempt can renew, complete, or fail its job | Guarded `UPDATE`s decided by the affected-row count. Leases are strict: an expired attempt loses its authority before the sweep even runs | `LeaseApiTests`, `FailureTests`; the demo's frozen-worker scenario |
+| A crashed or frozen worker's job runs again | Leases renewed by heartbeats, and a sweep that locks expired rows with `SKIP LOCKED`, so several API instances can sweep at once | `RecoveryTests`, including 8 concurrent sweeps; the demo's crash and frozen-worker scenarios |
+| When a report races recovery, exactly one of them wins | Both lock the same row. A report that waits behind recovery fails its guard when PostgreSQL re-checks it after the lock wait. Recovery skips a row a report holds (`SKIP LOCKED`) | `ReportRecoveryRaceTests`, which forces both orders |
+| Retries stop at `maxAttempts` | Every started attempt counts. The failure guard and the sweep both check the budget, and a CHECK constraint backs them | `FailureTests` |
+| A job's result is accepted at most once, and never replaced | Final states match no guard, and a unique index allows one successful attempt per job | `CompletionReplayTests`, `WorkerConcurrencyTests`, `JobSchemaInvariantTests` |
+| Retrying a submission or a report is safe | For submissions: a unique `Idempotency-Key`, `INSERT … ON CONFLICT DO NOTHING`, and a fingerprint of the request. For reports: an identical repeat is acknowledged as a replay, and anything else from that attempt gets `409` | `IdempotencyTests`, including 8 concurrent submissions; `CompletionReplayTests` |
+| A submission is all or nothing, and invalid input stores nothing | Validation finishes before the transaction starts. The experiment and its jobs share one transaction, which the repositories require (`Propagation.MANDATORY`) | `ExperimentServiceTests`, `ExperimentApiTests` |
+| Stored jobs never break the lifecycle's rules | CHECK constraints in the schema | `JobSchemaInvariantTests` |
+
+**Jobs run at least once, not exactly once.** A job can run more than once, for example after a
+crash, or when a worker that is still alive loses its lease. The scheduler accepts only one result
+per job. [docs/DESIGN.md](docs/DESIGN.md) has the full list, with the SQL and its reasoning.
+
+## The REST API
+
+`./sched` is a thin client of this API; any HTTP client works.
+
+| Endpoint | Used by | Does |
+|---|---|---|
+| `POST /experiments` | you | Submits up to 500 jobs, all or nothing. An `Idempotency-Key` header makes a retry safe |
+| `GET /experiments` | you | Lists the newest experiments first, with their progress |
+| `GET /experiments/{id}`, `…/jobs`, `…/best` | you | Returns progress, every job with its latest error, or the best results by `valAccuracy` |
+| `GET /jobs/{id}`, `GET /jobs/{id}/attempts` | you | Returns one job, or its attempt history |
+| `POST /worker/jobs/claim` | workers | Returns the oldest queued job with a 30-second lease, or `204` if none is queued |
+| `POST /worker/jobs/{id}/heartbeat` | workers | Renews the lease |
+| `POST /worker/jobs/{id}/complete`, `…/fail` | workers | Reports metrics, or a failure marked retryable or not |
 
 ```bash
 curl -s -X POST localhost:8080/experiments -H 'Content-Type: application/json' \
-  --data @examples/invalid-batch.json | jq
+  -H 'Idempotency-Key: my-batch-1' --data @examples/small-batch.json
 ```
 
-### Act as a worker by hand
+Errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem details, with a field-by-field
+list for invalid input. [docs/DESIGN.md](docs/DESIGN.md) documents every endpoint.
 
-Stop the real workers first (`docker compose up -d --scale worker=0`), or they will claim the jobs
-before you do. A claim's lease lasts 30 s. Heartbeat to extend it, or finish within it; after that,
-the job is taken back and your attempt id is rejected.
+## How it is verified
 
-```bash
-A=$(curl -s -X POST localhost:8080/worker/jobs/claim -H 'Content-Type: application/json' -d '{"workerId":"manual-1"}')
-echo "$A" | jq                                  # 200 with the assignment, or empty on 204 (nothing queued)
-JOB=$(jq -r .jobId <<<"$A"); ATTEMPT=$(jq -r .attemptId <<<"$A")
-METRICS='{"valAccuracy":0.91,"valLoss":0.25,"trainLoss":0.2,"trainingSeconds":1.5}'
+- **Tests.** `./sched test` runs both suites; it needs only Docker.
+  - The API's integration tests run against a real PostgreSQL.
+  - The concurrency tests release real threads together, and force both orders of the race
+    between a report and recovery.
+  - Each guard also had a mutation check: with the guard removed, its tests failed.
+- **The demo** checks 17 claims and exits with an error on any violation.
+- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs both test suites and the
+  demo on every push.
+- **Benchmarks.** `./sched bench` measures dispatch, submission, and training throughput, and fails
+  if any job was claimed or completed more than once.
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the method and one laptop's results. It also has
+  the experiment that found per-job logging costs about a third of dispatch throughput.
+- **Logs** are JSON lines with shared ids. `./sched logs --job 7` follows one job through the API
+  and every worker.
 
-curl -s -X POST localhost:8080/worker/jobs/$JOB/heartbeat -H 'Content-Type: application/json' \
-  -d "{\"attemptId\":\"$ATTEMPT\"}" | jq                           # 200: lease extended by 30 s
-curl -s -X POST localhost:8080/worker/jobs/$JOB/complete -H 'Content-Type: application/json' \
-  -d "{\"attemptId\":\"$ATTEMPT\",\"metrics\":$METRICS}" | jq     # 200: accepted and final
-curl -s -X POST localhost:8080/worker/jobs/$JOB/complete -H 'Content-Type: application/json' \
-  -d "{\"attemptId\":\"$ATTEMPT\",\"metrics\":$METRICS}" | jq     # 200 replayed: a lost-ack retry changes nothing
-```
+## Documentation
 
-## Tests
+| File | Contents |
+|---|---|
+| [docs/DESIGN.md](docs/DESIGN.md) | Schema, lifecycle, API contract, guarantees, transactions and time, the worker, logs, CI, and the decision log |
+| [docs/PROGRESS.md](docs/PROGRESS.md) | What was built, how each part was verified, and the known limitations |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | The benchmark's method, results, and experiments |
 
-The API's integration tests run against real PostgreSQL through Testcontainers, so Docker must be
-running.
+**Built with:**
 
-```bash
-cd api && ./mvnw verify          # with a local JDK 21
-scripts/mvnw-docker.sh verify    # without one: runs the Maven Wrapper in a JDK 21 container
+- Java 21, Spring Boot 4.1, Spring JDBC (explicit SQL, no JPA), Flyway, and PostgreSQL 18;
+- Python 3.14, PyTorch 2.14 on CPU, and uv;
+- Docker Compose, JUnit, Testcontainers, pytest, and GitHub Actions.
 
-cd worker && uv run pytest       # worker tests; uv installs the locked environment into worker/.venv
-```
-
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs both suites and `scripts/demo.sh`
-on every push, on a fresh GitHub-hosted runner. The demo's output appears in each run's summary.
+Every version is pinned exactly.
 
 ## Layout
 
 ```
-.github/        workflows/ci.yml: API tests, worker tests, and the demo on every push
+sched           The command-line tool
 api/            Spring Boot service: REST API, scheduling rules, all database access
-  src/main/resources/db/migration/   Flyway SQL migrations
 worker/         Python worker: claim → train (PyTorch, CPU) → report
-  scheduler_worker/   task.py (dataset, model, metrics), client.py (HTTP), worker.py (loop)
-compose.yaml    Local stack
-docs/           DESIGN.md (schema, lifecycle, API contract, guarantees, worker), PROGRESS.md,
-                BENCHMARKS.md (method and results), benchmarks/ (each run's generated data)
-examples/       Sample request bodies
-scripts/        demo.sh (checked end-to-end demo), benchmark.sh and bench/ (measurements),
-                make_sweep.py (grid sweeps), mvnw-docker.sh
+compose.yaml    The stack: PostgreSQL, the API, and workers
+docs/           DESIGN.md, PROGRESS.md, BENCHMARKS.md, and benchmarks/ (each run's data)
+examples/       Sample batches
+scripts/        demo.sh, benchmark.sh and bench/, make_sweep.py (the sweep grid), mvnw-docker.sh
+.github/        CI: API tests, worker tests, and the demo on every push
 ```

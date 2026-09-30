@@ -1,6 +1,6 @@
 # Progress
 
-_Last updated: 2026-09-30_ (3.3 done; CI awaiting its first GitHub run)
+_Last updated: 2026-09-30_ (milestone 3 complete; CI's first GitHub run still to be checked)
 
 ## Status
 
@@ -14,7 +14,7 @@ _Last updated: 2026-09-30_ (3.3 done; CI awaiting its first GitHub run)
 | 3.1 | CI (GitHub Actions): API tests, worker tests, and the checked demo on every push | built and replayed locally; not yet run on GitHub |
 | 3.2 | Structured logs: JSON lines with shared ids and event names from the API and workers | done |
 | 3.3 | Benchmarks: dispatch, submission, and training throughput, with correctness checks (`scripts/benchmark.sh`) | done |
-| 3.4 | Architecture README | next |
+| 3.4 | Architecture README: the one-page architecture, how to run it, and what each guarantee rests on | done |
 
 ## Completed
 
@@ -45,10 +45,10 @@ _Last updated: 2026-09-30_ (3.3 done; CI awaiting its first GitHub run)
   startup), sweep every 5 s. Overridable with `SCHEDULER_*` environment variables.
 - **Worker:** a heartbeat thread for training and reporting. A `409` or a full lease without a
   successful renewal stops training at the next minibatch.
-- **`CLAUDE.md`:** commands, architecture rules, testing conventions, and environment gotchas.
 
-Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3 as `eefcd0e`, 2.4 as
-`b62e554`, 3.1 as `ba836a9`, and 3.2 as `3033c08`.
+Committed on branch `milestone-2`: 1.2–2.1 as `51658c3`, 2.2 as `e88a3df`, 2.3 as `4c28aca`, 2.4 as
+`7fcb040`, 3.1 as `089e984`, 3.2 as `e0b06ab`, and 3.3 as `8f800d5`. The branch is on
+`origin/milestone-2` (pushed 2026-09-30), and every push runs CI.
 
 **2.2**
 
@@ -118,7 +118,6 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
   - The sweep's hang guard went from 180 s to 300 s, and the crash scenario's from 90 s to 120 s.
     A 2-CPU x86 runner was estimated at roughly 45–145 s for the sweep, leaving too little
     headroom.
-- **`CLAUDE.md`:** the CI commands, and the rules for keeping versions in sync with the images.
 
 **3.2**
 
@@ -135,7 +134,7 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
   - The stale scenario ends by printing the job's timeline, built from the JSON logs of the API and
     all workers.
 - **Docs:** the field and event catalog, and query recipes, are in DESIGN.md ("Logs") and the
-  README. CLAUDE.md now treats logs as an interface.
+  README.
 
 **3.3**
 
@@ -163,9 +162,59 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
 - **Experiment knobs:** `BENCH_POOL_SIZE` and `BENCH_API_LOG_LEVEL`, which default to the stack's
   own values.
 
+**3.4**
+
+- **`./sched`** is a command-line tool in one standard-library Python file that runs on 3.9 or
+  later. It covers the whole lifecycle in short commands:
+  - `start`, `workers`, `logs`, and `stop`;
+  - `sweep`, `submit`, `list`, `status`, `watch`, `best`, `jobs`, and `job`;
+  - `demo`, `test`, and `bench`.
+
+  Commands default to the latest experiment. Submissions carry an automatic `Idempotency-Key`, so
+  one retry after a dropped connection is safe. Errors say what to do next. `./sched test` needs
+  only Docker: without a local JDK 21 or uv, both suites run in containers.
+- **`GET /experiments`** lists the newest experiments first, with their progress, so the CLI can
+  find "the latest" without keeping state.
+- **`README.md`** leads with four commands, then:
+  - the failure demo, and a table of every command;
+  - how it works, and each guarantee with what it rests on and the tests that show it;
+  - the REST API as a reference.
+- **CI** now also runs the CLI against the demo's stack after the demo.
+
 ## Verified (2026-09-29: macOS arm64, Docker Desktop 29.2.0)
 
+**3.4:**
+
+- **API:** `./sched test` ran 153 tests with 0 failures, 4 of them new for `GET /experiments`:
+  - newest first, each entry equal to `GET /experiments/{id}`, including jobs in mixed states;
+  - an empty list, the limit, and limits of 0 and 101.
+
+  Two mutations were caught: listing oldest first, and ignoring the limit.
+- **Worker:** 69 tests, 0 failures, run through `./sched test`'s container path. That path was run
+  with the system Python 3.9 and with uv hidden, so it installed `uv==0.12.20` from PyPI itself.
+- **The CLI, live, in the default project:**
+  - `start` became ready in 19 s from cached images.
+  - `sweep` and `watch` ran 100 jobs in 14 s with 2 workers, then showed the best 5.
+  - `list`, `status`, `best -n 3`, `jobs --failed`, `job 77`, `logs -n 6`, and `logs --job 77` all
+    worked.
+  - `submit` worked with the example batch. The invalid batch printed its four field errors and
+    exited `1`.
+  - A missing file, `--seeds 9`, an unknown experiment, and an unknown job each gave a
+    one-line message and exited `1`.
+  - `workers 3` ran three workers.
+  - Data survived `stop` and `start`, and `stop --delete-data` removed the volume.
+  - `demo stale` passed its 8 checks, and `bench bogus` and `demo bogus` failed with usage errors.
+- **README:** every guarantee was checked against DESIGN.md's G1–G6 and R1–R8, and every named test
+  class against its test methods. That pass corrected two statements: one case of the
+  report-recovery race was missing, and the demo's check count was misstated. The links resolve,
+  and the diagrams' columns line up.
+- **CI:** actionlint and zizmor report nothing for the new step.
+
 **3.3 (2026-09-30; the runs are in `docs/benchmarks/`):**
+
+The runs recorded commit `3033c08`. The branch's history was rewritten afterwards, and that commit
+is now `e0b06ab`, with identical `api/`, `worker/`, and `compose.yaml`. The runs' data names the new
+id.
 
 - **Main run `20260930T161444Z`:** all parts, 3 rounds, 7.4 minutes. It passed every check:
   - all 15 dispatch runs claimed and completed each of their 5,500 jobs exactly once;
@@ -297,7 +346,7 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
   - ranking in ascending order.
 - The first test run caught a real bug. `ExperimentService.create` called the `@Transactional`
   `submit` on `this`, which bypasses the proxy. `MANDATORY` propagation refused the writes; fixed
-  and documented in CLAUDE.md.
+  and documented.
 
 **2.3, worker: `uv run pytest` runs 62 tests, 0 failures** (the client reports `replayed`).
 
@@ -405,12 +454,12 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
   `jq` is the query tool, and removing a container removes its logs.
 - **Other:** bodies parsed before size limits, no local JDK.
 
-## Next: the rest of milestone 3 (evidence and polish)
+## Next
 
-1. **The first CI run:** push `milestone-2`, then check the three jobs and the demo's summary in the
-   Actions tab. Runner timings go here as observations, not benchmarks.
-2. **3.4 Architecture README:** the one-page architecture, how to run the demo, and what each
-   guarantee rests on.
+1. **Check CI's first run** in the Actions tab: the three jobs, and the demo's summary. Record the
+   result here, and runner timings as observations, not benchmarks.
+2. **Merge `milestone-2` into `main`** with a pull request. `main` still holds only the initial
+   commit, so the repository's front page doesn't show the project yet.
 3. **Optional: log events after commit.** The benchmark measured their cost. The change would take
    the log write out of the transaction, and drop DESIGN.md's rolled-back-event caveat. Then re-run
    `scripts/benchmark.sh api` and compare.

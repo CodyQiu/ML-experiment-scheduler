@@ -90,6 +90,10 @@ public class ExperimentService {
 		return new Submission.Replayed(experiments.findWithProgress(stored.experimentId()).orElseThrow());
 	}
 
+	public ExperimentListResponse listRecent(int limit) {
+		return new ExperimentListResponse(experiments.findRecentWithProgress(limit));
+	}
+
 	public ExperimentResponse get(long id) {
 		return experiments.findWithProgress(id).orElseThrow(() -> new NotFoundException("Experiment", id));
 	}

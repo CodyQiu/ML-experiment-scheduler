@@ -1,5 +1,5 @@
-# Continuous integration: the commands of local development (see CLAUDE.md), run on a fresh
-# GitHub-hosted x86_64 runner for every push.
+# Continuous integration: the commands of local development, run on a fresh GitHub-hosted
+# x86_64 runner for every push.
 #
 # Every action is pinned to a full commit SHA, because a tag can be moved to other code and a commit
 # cannot. The trailing comment names the release. Versions shared with the images (JDK, uv, Python)
@@ -126,6 +126,17 @@ jobs:
         env:
           KEEP: "1"
         run: scripts/demo.sh 2>&1 | tee "$RUNNER_TEMP/demo.log"
+
+      - name: Use the CLI against the demo's stack
+        # The stack is still up (KEEP=1), with the demo's experiments in it.
+        timeout-minutes: 2
+        env:
+          SCHED_API: http://localhost:18080
+        run: |
+          ./sched list
+          ./sched status
+          ./sched best -n 3
+          ./sched jobs --failed
 
       - name: Add the demo's output to the job summary
         if: ${{ !cancelled() }}
