@@ -12,7 +12,10 @@ public record Rejection(Reason reason, JobState jobState) {
 		LEASE_EXPIRED,
 
 		/** The job is not running under this attempt: reassigned, finished, or never this attempt's. */
-		ATTEMPT_NOT_CURRENT
+		ATTEMPT_NOT_CURRENT,
+
+		/** This attempt's result was already accepted, and the new report carries a different one. */
+		RESULT_CONFLICT
 
 	}
 

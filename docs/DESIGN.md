@@ -133,11 +133,14 @@ level.
 - **Backfill:** a `FAILED` attempt without a reason can only come from a job failed by hand under
   V1. It becomes `UNKNOWN` and `retryable = false`. `MigrationTests` covers this.
 
-### Planned (2.3)
+### V4: idempotency keys (implemented, `V4__idempotency_keys.sql`)
 
-`experiments.idempotency_key text UNIQUE` and `experiments.request_fingerprint
-text`, both set or both null. The key is global in scope, which is enough for a single-user local
-service.
+- **`experiments.idempotency_key`** is `UNIQUE`: at most one experiment per key. `NULL`s never
+  conflict, so submissions without a key are unaffected.
+- **`experiments.request_fingerprint`** is a CHECK-enforced partner of the key: both set or both
+  null.
+- **Scope and lifetime.** The key is global in scope, which is enough for a single-user local
+  service. Keys never expire (Stripe, for comparison, forgets them after 24 h).
 
 ## Job lifecycle
 
@@ -180,7 +183,7 @@ accepted result can never be overwritten.
   duplicate keys return 400. Integer literals are accepted for decimal fields.
 - Numbers are values, not spellings. A submitted `0.0001` may be echoed as `1.0E-4`, and PostgreSQL
   JSONB stores it as `0.00010`. All three are the same number. This is why request fingerprints
-  (2.3) are computed from parsed values, never from JSON text.
+  are computed from parsed values, never from JSON text.
 - Errors use RFC 9457 problem details (`application/problem+json`) and always include a `code`.
   Field problems add `errors: [{field, message}]` with paths such as `jobs[1].config.epochs`.
   Bean Validation reports every violated constraint at once. A JSON type error stops parsing, so
@@ -188,7 +191,7 @@ accepted result can never be overwritten.
 
 | Endpoint | Purpose | Success | Errors | Status |
 |---|---|---|---|---|
-| `POST /experiments` | Submit a batch | `201` + `Location` | `400`; 2.3: `409` | implemented |
+| `POST /experiments` | Submit a batch (optional `Idempotency-Key`) | `201` + `Location`; `200` replay | `400`, `409` | implemented |
 | `GET /experiments/{id}` | Details + progress counts | `200` | `404` | implemented |
 | `GET /experiments/{id}/jobs` | Jobs in `jobIndex` order | `200` | `404` | implemented |
 | `GET /jobs/{id}` | One job | `200` | `404` | implemented |
@@ -198,7 +201,7 @@ accepted result can never be overwritten.
 | `POST /worker/jobs/{id}/heartbeat` | Renew the lease | `200` | `400`, `404`, `409` | implemented |
 | `POST /worker/jobs/{id}/fail` | Report a failure | `200` with the new state | `400`, `404`, `409` | implemented |
 | `GET /jobs/{id}/attempts` | Attempt history | `200` | `404` | implemented |
-| `GET /experiments/{id}/best?limit=N` | Top successful jobs by `valAccuracy` | `200` | `404` | 2.3 |
+| `GET /experiments/{id}/best?limit=N` | Top successful jobs by `valAccuracy` | `200` | `400`, `404` | implemented |
 
 ### `POST /experiments`
 
@@ -249,13 +252,41 @@ default that could change later.
             {"field": "jobs[1].config.learningRate", "message": "must be less than or equal to 1.0"}]}
 ```
 
-**Idempotency-Key (2.3).** This is the header's planned behavior:
+**Idempotency-Key** (optional header, 1–255 visible ASCII characters, otherwise `400`):
 
-- Same key with the same normalized request: `200` with the original experiment, and no new rows.
-- Same key with a different request: `409 IDEMPOTENCY_KEY_REUSED`.
-- Concurrent requests with the same key: exactly one experiment is created.
+| Situation | Response |
+|---|---|
+| First use of the key | `201`, and the key plus the request's fingerprint are stored with the experiment |
+| Same key, same request (by meaning) | `200` with the original experiment, including its current progress, and header `Idempotent-Replayed: true`. Nothing is created |
+| Same key, different request | `409 IDEMPOTENCY_KEY_REUSED` with `experimentId`. Nothing is created |
+| Concurrent requests with one key | Exactly one `201`; the rest are `200` or `409` as above (verified with 10 parallel curls) |
+
+**What "the same request" means.** Identity is the SHA-256 fingerprint of the *validated* request
+(`RequestFingerprint`), not of its bytes:
+
+- Key order, number spelling (`0.0001` / `1e-4` / `1.0E-4`), and an omitted default (`maxAttempts`)
+  do not change it, because the request is parsed into typed records first.
+- The canonical text is built from those records with explicitly sorted keys and plain-decimal
+  numbers, so it doesn't depend on serializer settings either. A golden test pins it: fingerprints
+  are stored, and a changed canonical form would make retries after a deploy conflict.
+- Job order *does* count, because it decides job indexes.
 
 The mechanism is described under [Transactions, locking, and time](#transactions-locking-and-time).
+
+### `GET /experiments/{id}/best`
+
+```json
+{"experimentId": 3, "metric": "valAccuracy", "jobs": [
+  {"rank": 1, "jobId": 89, "jobIndex": 76, "seed": 0, "config": {…}, "valAccuracy": 0.995,
+   "metrics": {"valAccuracy": 0.995, "valLoss": 0.022, "trainLoss": 0.02, "trainingSeconds": 0.11}}]}
+```
+
+- Only `SUCCEEDED` jobs are ranked, by `valAccuracy` descending.
+- Ties are broken by `jobIndex`, keeping one ranking metric while making the order deterministic.
+- `limit` is 1–100, default 10. A value outside that range returns `400 VALIDATION_FAILED` with
+  field `limit`.
+- An experiment has at most 500 jobs, so the sort reads them through the experiment's index and
+  needs no index of its own.
 
 ### `GET /experiments/{id}/jobs` and `GET /jobs/{id}`
 
@@ -362,13 +393,18 @@ The upper bounds also reject non-finite values. JSON has no NaN, but an overflow
 errorType, errorMessage, retryable}]}`, oldest first. It deliberately omits attempt ids: a running
 attempt's id is its worker's credential.
 
-- Increment 2.3 adds `409 RESULT_CONFLICT`, and returns `200` with `"replayed": true` for an
-  identical retry.
+**Repeated completions** (a retry after a lost response):
+
+| The repeated report comes from… | Response |
+|---|---|
+| the attempt whose result was accepted, with the identical result | `200 {"state": "SUCCEEDED", "replayed": true}`. Nothing changes, not even `finished_at` |
+| the attempt whose result was accepted, with a different result | `409 RESULT_CONFLICT`. The accepted result stands |
+| a stale attempt, even with an identical payload | `409 ATTEMPT_NOT_CURRENT`. It was never this attempt's result to repeat |
+| the right attempt, but its first report arrives after the lease expired | `409 LEASE_EXPIRED`. Never a replay, because nothing was accepted |
 
 A `409` is a definitive rejection, so the worker must stop. Timeouts and `5xx` responses are
-transient, so the worker retries them with bounded backoff. In the MVP, a retried completion whose
-first delivery succeeded gets `409` with `jobState: SUCCEEDED`, and the worker can treat that as
-"already recorded."
+transient, so the worker retries them with bounded backoff. A retried report whose first delivery
+got through is acknowledged as a replay, and the worker logs "acknowledged on retry".
 
 ### Error codes
 
@@ -382,7 +418,8 @@ first delivery succeeded gets `409` with `jobState: SUCCEEDED`, and the worker c
 | `INTERNAL_ERROR` | 500 | Unexpected; details go to the log, not the client |
 | `ATTEMPT_NOT_CURRENT` | 409 | The attempt does not own a running job; `jobId` and `jobState` are included |
 | `LEASE_EXPIRED` | 409 | The attempt holds the running job, but its lease has passed (strict leases) |
-| `RESULT_CONFLICT`, `IDEMPOTENCY_KEY_REUSED` | 409 | (2.3) |
+| `RESULT_CONFLICT` | 409 | The attempt's accepted result differs from the one just reported |
+| `IDEMPOTENCY_KEY_REUSED` | 409 | The key belongs to a different request; `experimentId` names its experiment |
 
 ## Guarantees
 
@@ -402,8 +439,8 @@ first delivery succeeded gets `409` with `jobState: SUCCEEDED`, and the worker c
 - ~~A worker that crashes, or a claim response lost in transit, leaves its job `RUNNING`
   forever.~~ Fixed by R1.
 - ~~Failures cannot be reported.~~ Fixed in 2.2 (`/fail`; R4).
-- Submitting the same batch twice creates two experiments (2.3).
-- A completion retried after a lost response gets `409`, even though its result was stored (2.3).
+- ~~Submitting the same batch twice creates two experiments.~~ Fixed in 2.3 (R5), when the client sends an `Idempotency-Key`.
+- ~~A completion retried after a lost response gets `409`.~~ Fixed in 2.3 (R6).
 
 ### Reliability milestone
 
@@ -413,8 +450,8 @@ first delivery succeeded gets `409` with `jobState: SUCCEEDED`, and the worker c
 | R2 | Recovery is safe with several API instances | The sweep locks rows with `SKIP LOCKED` and re-checks expiry under the lock. No leader election | implemented; 8 concurrent sweeps recover each attempt exactly once |
 | R3 | A stale attempt cannot renew or complete a job, or replace a newer attempt's lease | Guards on `current_attempt_id`, `state`, and `lease_expires_at > now()`. Leases are strict: an expired attempt loses authority even before the sweep runs | implemented, tested, including `fail` |
 | R4 | Retries stop at `maxAttempts`, however attempts end | The fail guard re-queues only when `retryable AND attempt_count < max_attempts`, and the sweep fails a job whose final attempt expired. `jobs_queued_has_attempts_left` backs both: a mutation that ignored the budget was stopped by this CHECK | implemented; tested through failures alone and through a mix of expiries and failures |
-| R5 | Submissions are idempotent | Unique key, fingerprint, and one transaction | 2.3 |
-| R6 | Repeating a completion is safe | Identical replay → `200`, no mutation. Different payload → `409` | 2.3 |
+| R5 | Submissions with an `Idempotency-Key` are idempotent | Unique key, `INSERT … ON CONFLICT DO NOTHING` in the creating transaction, and a fingerprint comparison | implemented; tested sequentially, by meaning, and with 8 concurrent submissions of one or two bodies; verified live with 10 parallel curls |
+| R6 | Repeating a completion is safe | An identical repeat from the accepted attempt → `200` replay, no mutation. A different payload → `409 RESULT_CONFLICT`. Stale or late → the usual rejection | implemented; tested, including 8 simultaneous identical deliveries (1 accepted, 7 replayed) |
 | R7 | At most one accepted success per job | The terminal-state guard plus `attempts_one_success_per_job` | implemented, tested |
 | R8 | A completion racing lease-expiry recovery: exactly one wins | Both sides lock the same row; the loser's guard fails on re-check (or `SKIP LOCKED` passes over it) | implemented; both orders forced deterministically in tests |
 
@@ -595,16 +632,36 @@ Nobody heartbeats that attempt, so its lease expires and the sweep re-queues the
 one lease duration and one attempt from the budget. The job does not run twice because of this,
 since nobody executes the lost attempt.
 
-**Idempotent submission (planned, 2.3).**
+**Idempotent submission** (`ExperimentService.submit`). One transaction does all of this:
 
 1. `INSERT INTO experiments (…, idempotency_key, request_fingerprint) VALUES (…) ON CONFLICT
-   (idempotency_key) DO NOTHING RETURNING id` runs inside the submission transaction.
-2. A concurrent insert with the same key blocks on the unique index until the first transaction
-   finishes, and then inserts nothing.
-3. In that case, a follow-up `SELECT` sees the committed row, because READ COMMITTED takes a new
-   snapshot per statement, and compares fingerprints.
-4. The fingerprint is a SHA-256 over a canonical serialization of the validated request, with
-   defaults applied, keys sorted, and numbers formatted from parsed values.
+   (idempotency_key) DO NOTHING RETURNING id`.
+2. If a row came back, insert the jobs. Created.
+3. Otherwise the key was taken. `SELECT id, request_fingerprint … WHERE idempotency_key = :key`,
+   then compare fingerprints: equal is a replay, different is `IDEMPOTENCY_KEY_REUSED`.
+
+**Why concurrent duplicates can't both create.**
+
+- While transaction A has inserted the key but not committed, B's `INSERT … ON CONFLICT` *waits*
+  for A.
+- If A commits, B inserts nothing. B's follow-up `SELECT` is a new statement with a new snapshot
+  under READ COMMITTED, so it sees A's row, and A's jobs, which committed with it.
+- If A rolled back, B's insert proceeds.
+- This relies on READ COMMITTED. Under REPEATABLE READ, B's snapshot would predate A's commit, and
+  PostgreSQL would raise a serialization error instead.
+- Mutation-tested: without `ON CONFLICT`, a duplicate key is a unique-constraint violation, and
+  even a sequential retry fails with a 500.
+- Side effect: every losing insert still draws an id from the sequence (sequences never roll
+  back), so experiment ids have gaps.
+
+**Classifying a rejected completion.** The guarded `UPDATE` decides first, and a replay is
+recognized only after it has refused to write:
+
+- The service reads the job. If it is `SUCCEEDED` under the same attempt, it compares the stored
+  result with the new one as JSONB (`result = CAST(:result AS jsonb)`, equal by meaning, not by
+  text).
+- This read can't race anything: a `SUCCEEDED` job's attempt and result never change.
+- It only chooses the response. Nothing is written either way.
 
 **Multiple API instances.** Claims (`SKIP LOCKED`), sweeps (`SKIP LOCKED` plus re-checked guards),
 and Flyway migrations (which take an advisory lock) are all safe to run concurrently.
@@ -674,7 +731,7 @@ Training runs on one CPU thread with `torch.use_deterministic_algorithms(True)`.
 | Timeouts | 3 s to connect and 10 s to read, on every request |
 | Claim fails (connection error, timeout, `5xx`) | **Not retried** immediately. A claim is not idempotent: if it committed and only the response was lost, retrying would claim a second job while the first stays `RUNNING` under an attempt nobody holds. The worker just polls again later |
 | Completion fails (connection error, timeout, `5xx`) | Retried, up to 5 attempts with jittered backoff from 0.5 s to 8 s. This is safe because the API's guard accepts at most one result per job, and only from the running attempt, so a duplicate can never overwrite anything |
-| `409` on completion | Definitive. The result is discarded and the loop continues. `jobState: SUCCEEDED` after a retry usually means the earlier delivery succeeded; 2.3 makes that an explicit replay |
+| `409` on completion | Definitive. The result is discarded and the loop continues. An earlier delivery that got through now comes back as `200` with `replayed: true` instead |
 | Heartbeat fails transiently | Sent once. The heartbeat thread tries again at its next interval; two misses in a row still leave the lease alive |
 | Failure report fails transiently | Retried like a completion (5 attempts), and safe for the same reason. If it never gets through, the lease expires and recovery records the attempt `EXPIRED` |
 | `409` on heartbeat | Definitive: the lease is lost. Training stops at the next minibatch and nothing is reported |
@@ -779,3 +836,9 @@ forbids.
 | `retryable` comes from the worker; the budget comes from the server | Only the worker knows whether an error is deterministic. Only the server can enforce the limit across workers |
 | Every started execution counts against `maxAttempts`, including shutdowns | A simple, uniform rule, and attempt numbers are never reused |
 | Attempt history at `GET /jobs/{id}/attempts`, plus `lastError` on job responses | Details on demand, while list views still show why a job failed without one request per job. Attempt ids are never exposed |
+| The idempotency fingerprint comes from the validated records, and the canonical text is pinned by a golden test | Identity by meaning. Stored fingerprints must survive upgrades; the golden test catches an accidental change, which calls for bumping `VERSION` |
+| A duplicate is detected by `ON CONFLICT` on a unique constraint, not by checking first | A check-then-insert has a window in which two requests both see "no key". The constraint closes it, including against uncommitted rows |
+| A replay returns `200` with `Idempotent-Replayed: true`, not `201` | Nothing was created. The header is the convention Stripe uses |
+| A replayed completion is recognized only after the guarded write was refused, and only from terminal data | The replay path cannot write, and cannot race |
+| `best` ties are broken by `jobIndex` | One ranking metric, as specified, with a deterministic order |
+| `ExperimentService.create` is `@Transactional` even though it only delegates to `submit` | A call on `this` bypasses the proxy. `MANDATORY` propagation made the missing transaction fail on the first test run |

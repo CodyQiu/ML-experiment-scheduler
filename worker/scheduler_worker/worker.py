@@ -108,15 +108,16 @@ class Worker:
 
     def _report_success(self, assignment: Assignment, tag: str, metrics: task.Metrics) -> None:
         try:
-            self._client.complete(assignment.job_id, assignment.attempt_id, metrics.to_json())
+            replayed = self._client.complete(assignment.job_id, assignment.attempt_id, metrics.to_json())
         except AttemptRejected as exc:
             log.warning("%s result rejected (%s; job is %s); discarded", tag, exc.code, exc.job_state)
             return
         except (ApiUnavailable, ApiError) as exc:
             log.error("%s result could not be reported: %s; discarded (its lease will expire)", tag, exc)
             return
-        log.info("%s done: valAccuracy=%.4f valLoss=%.4f trainingSeconds=%.2f", tag, metrics.val_accuracy,
-                 metrics.val_loss, metrics.training_seconds)
+        log.info("%s done%s: valAccuracy=%.4f valLoss=%.4f trainingSeconds=%.2f", tag,
+                 " (acknowledged on retry)" if replayed else "", metrics.val_accuracy, metrics.val_loss,
+                 metrics.training_seconds)
 
     def _report_failure(self, assignment: Assignment | tuple[int, UUID], tag: str, *, retryable: bool,
                         error_type: str, message: str) -> None:

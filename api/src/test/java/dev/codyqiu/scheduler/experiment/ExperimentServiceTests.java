@@ -38,7 +38,7 @@ class ExperimentServiceTests extends IntegrationTest {
 
 	@Test
 	void repositoryWritesRefuseToRunOutsideATransaction() {
-		assertThatThrownBy(() -> experimentRepository.insert("orphan", Task.SYNTHETIC_MLP_V1, 3))
+		assertThatThrownBy(() -> experimentRepository.insert("orphan", Task.SYNTHETIC_MLP_V1, 3, null, null))
 			.isInstanceOf(IllegalTransactionStateException.class);
 		assertThat(countRows("experiments")).isZero();
 	}

@@ -5,9 +5,9 @@ a small CPU-only PyTorch model on a deterministic synthetic dataset, and report 
 project is about correctness under concurrency and failure: atomic claims, leases, fencing tokens,
 bounded retries, and idempotent submission, all backed by PostgreSQL.
 
-**Status:** milestone 1 (end-to-end MVP) is complete. In milestone 2, leases, heartbeats, crash
-recovery (2.1), failure reports, and bounded retries (2.2) work; idempotent submission and replays
-come next. See
+**Status:** milestone 1 (end-to-end MVP) is complete. Milestone 2's reliability features work:
+leases, heartbeats, crash recovery (2.1), failure reports, bounded retries (2.2), idempotent
+submission, and safe repeated completion (2.3). Scripted failure demos come next. See
 [docs/PROGRESS.md](docs/PROGRESS.md) and [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Quick start
@@ -17,16 +17,17 @@ Requires Docker with Compose v2 and `jq`. A local JDK or Python is optional.
 ```bash
 docker compose up -d --build --wait     # PostgreSQL 18, the API on localhost:8080, one worker
 
-# Submit six configs and keep the new experiment's id
+# Submit six configs and keep the new experiment's id. With an Idempotency-Key, a retry of this
+# exact request returns the same experiment instead of creating another one.
 ID=$(curl -s -X POST localhost:8080/experiments -H 'Content-Type: application/json' \
-       --data @examples/small-batch.json | jq .id)
+       -H 'Idempotency-Key: quickstart-1' --data @examples/small-batch.json | jq .id)
 
 # Watch progress until every job has finished (a few seconds; Ctrl-C to quit)
 while sleep 1; do curl -s localhost:8080/experiments/$ID | jq -c .progress; done
 
 # Compare the successful configurations, best first
-curl -s localhost:8080/experiments/$ID/jobs | jq -r '.jobs | map(select(.state == "SUCCEEDED"))
-  | sort_by(-.valAccuracy)[] | "\(.valAccuracy)  \(.config.optimizer) lr=\(.config.learningRate) \(.config.hiddenUnits)x\(.config.hiddenLayers)"'
+curl -s "localhost:8080/experiments/$ID/best?limit=5" | jq -r '.jobs[] |
+  "#\(.rank) \(.valAccuracy)  \(.config.optimizer) lr=\(.config.learningRate) \(.config.hiddenUnits)x\(.config.hiddenLayers)"'
 
 docker compose logs worker              # claim → train → report, one line each
 
@@ -86,7 +87,7 @@ curl -s -X POST localhost:8080/worker/jobs/$JOB/heartbeat -H 'Content-Type: appl
 curl -s -X POST localhost:8080/worker/jobs/$JOB/complete -H 'Content-Type: application/json' \
   -d "{\"attemptId\":\"$ATTEMPT\",\"metrics\":$METRICS}" | jq     # 200: accepted and final
 curl -s -X POST localhost:8080/worker/jobs/$JOB/complete -H 'Content-Type: application/json' \
-  -d "{\"attemptId\":\"$ATTEMPT\",\"metrics\":$METRICS}" | jq     # 409 ATTEMPT_NOT_CURRENT: already SUCCEEDED
+  -d "{\"attemptId\":\"$ATTEMPT\",\"metrics\":$METRICS}" | jq     # 200 replayed: a lost-ack retry changes nothing
 ```
 
 ## Tests

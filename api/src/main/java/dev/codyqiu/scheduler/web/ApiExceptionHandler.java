@@ -24,6 +24,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
@@ -43,6 +44,11 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(NotFoundException.class)
 	ProblemDetail handleNotFound(NotFoundException ex) {
 		return problem(HttpStatus.NOT_FOUND, "NOT_FOUND", ex.getMessage());
+	}
+
+	@ExceptionHandler(RequestValidationException.class)
+	ProblemDetail handleInvalidRequest(RequestValidationException ex) {
+		return validationProblem(List.of(new FieldViolation(ex.field(), ex.getMessage())));
 	}
 
 	@ExceptionHandler(ConflictException.class)
@@ -66,6 +72,21 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 			.getFieldErrors()
 			.stream()
 			.map(error -> new FieldViolation(error.getField(), error.getDefaultMessage()))
+			.sorted(Comparator.comparing(FieldViolation::field).thenComparing(FieldViolation::message))
+			.toList();
+		return handleExceptionInternal(ex, validationProblem(violations), headers, status, request);
+	}
+
+	/** Constraint violations on parameters such as {@code ?limit=}, named after the parameter. */
+	@Override
+	protected ResponseEntity<Object> handleHandlerMethodValidationException(HandlerMethodValidationException ex,
+			HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+		List<FieldViolation> violations = ex.getParameterValidationResults()
+			.stream()
+			.flatMap(result -> result.getResolvableErrors()
+				.stream()
+				.map(error -> new FieldViolation(result.getMethodParameter().getParameterName(),
+						error.getDefaultMessage())))
 			.sorted(Comparator.comparing(FieldViolation::field).thenComparing(FieldViolation::message))
 			.toList();
 		return handleExceptionInternal(ex, validationProblem(violations), headers, status, request);

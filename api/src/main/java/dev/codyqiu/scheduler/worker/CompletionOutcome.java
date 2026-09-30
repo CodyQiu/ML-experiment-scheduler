@@ -10,6 +10,13 @@ public sealed interface CompletionOutcome {
 	record Accepted() implements CompletionOutcome {
 	}
 
+	/**
+	 * A repeat of the report that was already accepted, e.g. a retry after a lost response. Nothing
+	 * changed; the worker can treat it exactly like {@link Accepted}.
+	 */
+	record Replayed() implements CompletionOutcome {
+	}
+
 	/** The guarded update matched no row, so nothing changed. */
 	record Rejected(Rejection rejection) implements CompletionOutcome {
 	}

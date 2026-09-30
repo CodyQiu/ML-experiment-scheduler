@@ -209,6 +209,36 @@ public class JobRepository {
 			.optional();
 	}
 
+	/** Whether the job's accepted result equals {@code metrics}, compared as JSONB (by meaning, not text). */
+	public boolean resultMatches(long jobId, TrainingMetrics metrics) {
+		return jdbc.sql("SELECT COALESCE(result = CAST(:result AS jsonb), false) FROM jobs WHERE id = :jobId")
+			.param("result", jsonMapper.writeValueAsString(metrics))
+			.param("jobId", jobId)
+			.query(Boolean.class)
+			.single();
+	}
+
+	/**
+	 * Successful jobs ranked by validation accuracy (larger is better), ties broken by position in
+	 * the batch so the order is deterministic. An experiment has at most 500 jobs, so sorting them
+	 * through the experiment's index needs no index of its own.
+	 */
+	public List<RankedJob> findBest(long experimentId, int limit) {
+		return jdbc.sql("""
+				SELECT id, job_index, seed, config, val_accuracy, result
+				FROM jobs
+				WHERE experiment_id = :experimentId AND state = 'SUCCEEDED'
+				ORDER BY val_accuracy DESC, job_index
+				LIMIT :limit
+				""")
+			.param("experimentId", experimentId)
+			.param("limit", limit)
+			.query((rs, rowNum) -> new RankedJob(rowNum + 1, rs.getLong("id"), rs.getInt("job_index"),
+					rs.getInt("seed"), jsonMapper.readValue(rs.getString("config"), SyntheticMlpConfig.class),
+					rs.getDouble("val_accuracy"), jsonMapper.readValue(rs.getString("result"), TrainingMetrics.class)))
+			.list();
+	}
+
 	/** Explains an already-rejected request by {@code attemptId}. Never used to decide a write. */
 	public Optional<AttemptStanding> findStanding(long jobId, UUID attemptId) {
 		return jdbc.sql("""

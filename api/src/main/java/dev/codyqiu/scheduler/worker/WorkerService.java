@@ -5,9 +5,11 @@ import java.util.Optional;
 import java.util.UUID;
 
 import dev.codyqiu.scheduler.job.AttemptRepository;
+import dev.codyqiu.scheduler.job.AttemptStanding;
 import dev.codyqiu.scheduler.job.FailedAttempt;
 import dev.codyqiu.scheduler.job.JobAssignment;
 import dev.codyqiu.scheduler.job.JobRepository;
+import dev.codyqiu.scheduler.job.JobState;
 import dev.codyqiu.scheduler.lease.SchedulerProperties;
 import dev.codyqiu.scheduler.task.TrainingMetrics;
 import dev.codyqiu.scheduler.web.NotFoundException;
@@ -77,7 +79,21 @@ public class WorkerService {
 					metrics.valAccuracy());
 			return new CompletionOutcome.Accepted();
 		}
-		Rejection rejection = explainRejection(jobId, attemptId);
+		// Rejected. Classify it: this may be a repeat of the attempt's accepted report. The data read
+		// here is terminal (a SUCCEEDED job's attempt and result never change), so the classification
+		// cannot race anything; it only chooses the response, and nothing is written either way.
+		AttemptStanding standing = jobs.findStanding(jobId, attemptId)
+			.orElseThrow(() -> new NotFoundException("Job", jobId));
+		if (standing.jobState() == JobState.SUCCEEDED && standing.isCurrentAttempt()) {
+			if (jobs.resultMatches(jobId, metrics)) {
+				log.info("Replayed acknowledgement of job {} result from attempt {} (a repeated report; nothing changed)",
+						jobId, attemptId);
+				return new CompletionOutcome.Replayed();
+			}
+			log.warn("Rejected completion of job {} from attempt {}: its accepted result differs", jobId, attemptId);
+			return new CompletionOutcome.Rejected(new Rejection(Rejection.Reason.RESULT_CONFLICT, JobState.SUCCEEDED));
+		}
+		Rejection rejection = Rejection.explain(standing);
 		log.warn("Rejected completion of job {} from attempt {}: {} (job is {})", jobId, attemptId,
 				rejection.reason(), rejection.jobState());
 		return new CompletionOutcome.Rejected(rejection);

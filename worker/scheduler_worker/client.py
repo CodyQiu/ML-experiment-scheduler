@@ -67,16 +67,18 @@ class ApiClient:
             return response.json()
         raise ApiError(_describe(response))
 
-    def complete(self, job_id: int, attempt_id: UUID, metrics: dict[str, float]) -> None:
-        """Reports a successful result, retrying transient failures.
+    def complete(self, job_id: int, attempt_id: UUID, metrics: dict[str, float]) -> bool:
+        """Reports a successful result, retrying transient failures. Returns True if the API had
+        already accepted this exact report, i.e. an earlier delivery got through but its response
+        was lost.
 
         Retrying is safe. The API accepts a result only from the job's running attempt, and only
-        once, so a duplicate delivery can never overwrite anything.
+        once; an identical repeat is acknowledged without changing anything.
         """
         body = {"attemptId": str(attempt_id), "metrics": metrics}
         response = self._post(f"/worker/jobs/{job_id}/complete", body, attempts=self._report_attempts)
         if response.status_code == 200:
-            return
+            return bool(response.json().get("replayed", False))
         if response.status_code == 409:
             raise _rejection(job_id, response)
         raise ApiError(_describe(response))

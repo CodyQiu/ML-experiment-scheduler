@@ -175,10 +175,10 @@ class WorkerApiTests extends IntegrationTest {
 		String attemptId = body(claim("worker-1"), HttpStatus.OK).get("attemptId").asString();
 		assertThat(complete(jobId, attemptId, TestData.metrics(0.90))).hasStatus(HttpStatus.OK);
 
-		// Even the attempt that produced the result cannot replace it. (Milestone 2 turns an
-		// identical retry into a 200 replay; a different payload stays a conflict.)
+		// Even the attempt that produced the result cannot replace it. (An identical repeat is
+		// acknowledged as a replay; see CompletionReplayTests.)
 		JsonNode problem = problem(complete(jobId, attemptId, TestData.metrics(0.10)), HttpStatus.CONFLICT,
-				"ATTEMPT_NOT_CURRENT");
+				"RESULT_CONFLICT");
 		assertThat(problem.get("jobState").asString()).isEqualTo("SUCCEEDED");
 		assertThat(body(get("/jobs/" + jobId), HttpStatus.OK).get("result"))
 			.isEqualTo(json.valueToTree(TestData.metrics(0.90)));

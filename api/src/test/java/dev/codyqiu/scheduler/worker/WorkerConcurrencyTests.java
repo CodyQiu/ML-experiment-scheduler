@@ -87,15 +87,32 @@ class WorkerConcurrencyTests extends IntegrationTest {
 			.boxed()
 			.toList();
 		assertThat(winners).hasSize(1);
+		// Each loser waited for the winner's row lock, then found the attempt's result already
+		// accepted, and different from its own.
 		assertThat(outcomes).filteredOn(CompletionOutcome.Rejected.class::isInstance)
 			.hasSize(THREADS - 1)
 			.containsOnly(new CompletionOutcome.Rejected(
-					new Rejection(Rejection.Reason.ATTEMPT_NOT_CURRENT, JobState.SUCCEEDED)));
+					new Rejection(Rejection.Reason.RESULT_CONFLICT, JobState.SUCCEEDED)));
 		double stored = jdbc.sql("SELECT val_accuracy FROM jobs WHERE id = :id")
 			.param("id", assignment.jobId())
 			.query(Double.class)
 			.single();
 		assertThat(stored).isEqualTo(reports.get(winners.get(0)).valAccuracy());
+	}
+
+	@RepeatedTest(5)
+	void simultaneousDeliveriesOfTheSameReportAcceptOneAndReplayTheRest() throws Exception {
+		submitJobs(1);
+		JobAssignment assignment = workers.claim("worker-1").orElseThrow();
+
+		List<CompletionOutcome> outcomes = Concurrently.runTogether(IntStream.range(0, THREADS)
+			.mapToObj(i -> (Callable<CompletionOutcome>) () -> workers.complete(assignment.jobId(),
+					assignment.attemptId(), TestData.metrics(0.9)))
+			.toList());
+
+		assertThat(outcomes).filteredOn(CompletionOutcome.Accepted.class::isInstance).hasSize(1);
+		assertThat(outcomes).filteredOn(CompletionOutcome.Replayed.class::isInstance).hasSize(THREADS - 1);
+		assertThat(countRows("attempts")).isOne();
 	}
 
 	private List<JobAssignment> drainQueue(String workerId) {

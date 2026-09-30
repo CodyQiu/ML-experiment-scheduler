@@ -101,6 +101,15 @@ def test_completion_is_retried_through_transient_failures(stub_api):
     assert len(sleeps) == 2 and 0.25 <= sleeps[0] <= 0.5 and 0.5 <= sleeps[1] <= 1.0
 
 
+def test_completion_reports_whether_the_api_had_already_accepted_it(stub_api):
+    # A timed-out first delivery that did get through, then its retry: the API acknowledges the
+    # repeat without changing anything.
+    api = stub_api((200, {}, 0.5), (200, {"jobId": 5, "state": "SUCCEEDED", "replayed": True}, 0))
+
+    assert client_for(api.url, [], read_timeout=0.1).complete(5, uuid4(), METRICS) is True
+    assert len(api.requests) == 2
+
+
 def test_completion_retries_are_bounded(stub_api):
     api = stub_api(*[(503, None, 0)] * 3)
 

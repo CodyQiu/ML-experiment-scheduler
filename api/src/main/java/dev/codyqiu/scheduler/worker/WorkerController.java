@@ -47,7 +47,8 @@ public class WorkerController {
 	@PostMapping("/{jobId}/complete")
 	public CompletionResponse complete(@PathVariable long jobId, @Valid @RequestBody CompleteJobRequest request) {
 		return switch (workers.complete(jobId, request.attemptId(), request.metrics())) {
-			case CompletionOutcome.Accepted() -> new CompletionResponse(jobId, JobState.SUCCEEDED);
+			case CompletionOutcome.Accepted() -> new CompletionResponse(jobId, JobState.SUCCEEDED, false);
+			case CompletionOutcome.Replayed() -> new CompletionResponse(jobId, JobState.SUCCEEDED, true);
 			case CompletionOutcome.Rejected(Rejection rejection) -> throw conflict(jobId, request.attemptId(), rejection);
 		};
 	}
@@ -66,6 +67,8 @@ public class WorkerController {
 		String detail = switch (rejection.reason()) {
 			case LEASE_EXPIRED -> "The lease of attempt %s on job %d has expired".formatted(attemptId, jobId);
 			case ATTEMPT_NOT_CURRENT -> "Attempt %s is not the running attempt of job %d".formatted(attemptId, jobId);
+			case RESULT_CONFLICT -> "Attempt %s already reported a different result for job %d".formatted(attemptId,
+					jobId);
 		};
 		return new ConflictException(rejection.reason().name(), detail,
 				Map.of("jobId", jobId, "jobState", rejection.jobState()));
