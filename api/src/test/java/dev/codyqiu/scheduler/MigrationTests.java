@@ -16,7 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class MigrationTests {
 
 	@Test
-	void upgradingToV2MakesStuckV1JobsRecoverableAndRecordsTheirLatestAttempt() {
+	void upgradingFromV1MakesStuckJobsRecoverableAndExplainsEveryAttempt() {
 		try (PostgreSQLContainer postgres = new PostgreSQLContainer(
 				DockerImageName.parse(TestcontainersConfiguration.POSTGRES_IMAGE))) {
 			postgres.start();
@@ -25,7 +25,7 @@ class MigrationTests {
 			JdbcClient jdbc = JdbcClient.create(dataSource);
 
 			Flyway.configure().dataSource(dataSource).target("1").load().migrate();
-			// V1-era rows: queued, RUNNING (without a lease, so V1 could never recover it), and succeeded.
+			// V1-era rows: queued, RUNNING (without a lease, so V1 could never recover it), succeeded, failed.
 			jdbc.sql("INSERT INTO experiments (name, task, max_attempts) VALUES ('legacy', 'synthetic-mlp-v1', 3)")
 				.update();
 			jdbc.sql("""
@@ -35,7 +35,9 @@ class MigrationTests {
 					       (1, 1, 1, '{}', 3, 'RUNNING', 1, '00000000-0000-0000-0000-000000000001', 'old-worker',
 					        now(), NULL, NULL, NULL),
 					       (1, 2, 2, '{}', 3, 'SUCCEEDED', 1, '00000000-0000-0000-0000-000000000002', 'old-worker',
-					        now(), 0.9, '{"valAccuracy": 0.9}', now())
+					        now(), 0.9, '{"valAccuracy": 0.9}', now()),
+					       (1, 3, 3, '{}', 3, 'FAILED', 1, '00000000-0000-0000-0000-000000000003', 'old-worker',
+					        now(), NULL, NULL, now())
 					""").update();
 
 			Flyway.configure().dataSource(dataSource).load().migrate();
@@ -46,10 +48,15 @@ class MigrationTests {
 				.list()).containsExactly(1);
 			// ...and has a RUNNING attempt row that recovery can mark EXPIRED. Every claimed job got a
 			// row for its latest attempt, mirroring the job's state.
-			assertThat(jdbc.sql("SELECT id::text || ' ' || attempt_number || ' ' || status FROM attempts ORDER BY job_id")
-				.query(String.class)
-				.list()).containsExactly("00000000-0000-0000-0000-000000000001 1 RUNNING",
-						"00000000-0000-0000-0000-000000000002 1 SUCCEEDED");
+			assertThat(jdbc.sql("""
+					SELECT id::text || ' ' || attempt_number || ' ' || status || ' ' || COALESCE(error_type, '-')
+					       || ' ' || COALESCE(retryable::text, '-')
+					FROM attempts ORDER BY job_id
+					""").query(String.class).list()).containsExactly(
+						"00000000-0000-0000-0000-000000000001 1 RUNNING - -",
+						"00000000-0000-0000-0000-000000000002 1 SUCCEEDED - -",
+						// A job failed by hand under V1 had no recorded reason; V3 marks it UNKNOWN and terminal.
+						"00000000-0000-0000-0000-000000000003 1 FAILED UNKNOWN false");
 		}
 	}
 

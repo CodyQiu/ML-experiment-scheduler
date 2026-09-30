@@ -38,7 +38,13 @@ class StubApi:
             def log_message(self, *args):
                 pass
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class Server(ThreadingHTTPServer):
+            def handle_error(self, request, client_address):
+                # A client that timed out closes its socket before the delayed reply is written;
+                # that is the scenario under test, not an error.
+                pass
+
+        self.server = Server(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
 
@@ -163,3 +169,26 @@ def test_a_failed_heartbeat_is_not_retried_by_the_client(stub_api):
         client_for(api.url, sleeps).heartbeat(5, uuid4())
     assert len(api.requests) == 1
     assert sleeps == []
+
+
+def test_a_failure_report_returns_the_new_state_and_is_retried_through_transient_errors(stub_api):
+    api = stub_api((503, None, 0), (200, {"jobId": 5, "state": "QUEUED"}, 0))
+    attempt_id = uuid4()
+
+    state = client_for(api.url, []).fail(5, attempt_id, retryable=True, error_type="WORKER_ERROR", message="x" * 5000)
+
+    assert state == "QUEUED"
+    assert len(api.requests) == 2
+    path, body = api.requests[0]
+    assert path == "/worker/jobs/5/fail"
+    assert (body["attemptId"], body["retryable"], body["errorType"]) == (str(attempt_id), True, "WORKER_ERROR")
+    assert len(body["message"]) == 2000  # truncated to what the API accepts
+
+
+def test_a_rejected_failure_report_raises(stub_api):
+    api = stub_api((409, {"code": "LEASE_EXPIRED", "jobState": "RUNNING", "detail": "expired"}, 0))
+
+    with pytest.raises(AttemptRejected) as rejected:
+        client_for(api.url, []).fail(5, uuid4(), retryable=False, error_type="TRAINING_DIVERGED", message="nan")
+    assert rejected.value.code == "LEASE_EXPIRED"
+    assert len(api.requests) == 1

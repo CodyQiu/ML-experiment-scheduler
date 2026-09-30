@@ -5,6 +5,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 import dev.codyqiu.scheduler.job.AttemptRepository;
+import dev.codyqiu.scheduler.job.FailedAttempt;
 import dev.codyqiu.scheduler.job.JobAssignment;
 import dev.codyqiu.scheduler.job.JobRepository;
 import dev.codyqiu.scheduler.lease.SchedulerProperties;
@@ -80,6 +81,28 @@ public class WorkerService {
 		log.warn("Rejected completion of job {} from attempt {}: {} (job is {})", jobId, attemptId,
 				rejection.reason(), rejection.jobState());
 		return new CompletionOutcome.Rejected(rejection);
+	}
+
+	/**
+	 * Ends the attempt with a reported failure, guarded exactly like completion. A retryable failure
+	 * returns the job to the queue while attempts remain; otherwise the job fails for good. Either
+	 * way the attempt row records the reason.
+	 */
+	@Transactional
+	public FailureOutcome fail(long jobId, UUID attemptId, boolean retryable, String errorType, String message) {
+		Optional<FailedAttempt> failed = jobs.markFailed(jobId, attemptId, retryable);
+		if (failed.isPresent()) {
+			attempts.markFailed(attemptId, errorType, message, retryable);
+			FailedAttempt transition = failed.get();
+			log.warn("Job {} attempt {} ({}) failed: {} (retryable={}); job is now {} ({} of {} attempts used)", jobId,
+					transition.attemptNumber(), attemptId, errorType, retryable, transition.newState(),
+					transition.attemptNumber(), transition.maxAttempts());
+			return new FailureOutcome.Recorded(transition.newState());
+		}
+		Rejection rejection = explainRejection(jobId, attemptId);
+		log.warn("Rejected failure report of job {} from attempt {}: {} (job is {})", jobId, attemptId,
+				rejection.reason(), rejection.jobState());
+		return new FailureOutcome.Rejected(rejection);
 	}
 
 	private Rejection explainRejection(long jobId, UUID attemptId) {

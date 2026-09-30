@@ -52,6 +52,16 @@ public class WorkerController {
 		};
 	}
 
+	/** {@code 200} with the job's new state; {@code 409} if the attempt has lost its authority. */
+	@PostMapping("/{jobId}/fail")
+	public FailureResponse fail(@PathVariable long jobId, @Valid @RequestBody FailJobRequest request) {
+		return switch (workers.fail(jobId, request.attemptId(), request.retryable(), request.errorType(),
+				request.message())) {
+			case FailureOutcome.Recorded(JobState jobState) -> new FailureResponse(jobId, jobState);
+			case FailureOutcome.Rejected(Rejection rejection) -> throw conflict(jobId, request.attemptId(), rejection);
+		};
+	}
+
 	private static ConflictException conflict(long jobId, UUID attemptId, Rejection rejection) {
 		String detail = switch (rejection.reason()) {
 			case LEASE_EXPIRED -> "The lease of attempt %s on job %d has expired".formatted(attemptId, jobId);

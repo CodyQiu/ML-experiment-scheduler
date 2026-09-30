@@ -5,8 +5,9 @@ a small CPU-only PyTorch model on a deterministic synthetic dataset, and report 
 project is about correctness under concurrency and failure: atomic claims, leases, fencing tokens,
 bounded retries, and idempotent submission, all backed by PostgreSQL.
 
-**Status:** milestone 1 (end-to-end MVP) is complete. In milestone 2, leases, heartbeats, and
-crash recovery work (2.1); failure reports, idempotent submission, and replays come next. See
+**Status:** milestone 1 (end-to-end MVP) is complete. In milestone 2, leases, heartbeats, crash
+recovery (2.1), failure reports, and bounded retries (2.2) work; idempotent submission and replays
+come next. See
 [docs/PROGRESS.md](docs/PROGRESS.md) and [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Quick start
@@ -28,6 +29,10 @@ curl -s localhost:8080/experiments/$ID/jobs | jq -r '.jobs | map(select(.state =
   | sort_by(-.valAccuracy)[] | "\(.valAccuracy)  \(.config.optimizer) lr=\(.config.learningRate) \(.config.hiddenUnits)x\(.config.hiddenLayers)"'
 
 docker compose logs worker              # claim → train → report, one line each
+
+# Failures at a glance, and one job's full history
+curl -s localhost:8080/experiments/$ID/jobs | jq -c '.jobs[] | select(.lastError) | {id, state, lastError}'
+curl -s localhost:8080/jobs/1/attempts | jq
 ```
 
 **More workers and a bigger batch.** This runs the 100-config grid; add `--seeds 2` for 200 jobs.

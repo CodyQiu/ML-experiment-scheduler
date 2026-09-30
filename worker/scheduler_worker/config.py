@@ -94,6 +94,15 @@ class Assignment:
         )
 
 
+def identify(data: Mapping[str, Any]) -> tuple[int, UUID] | None:
+    """The job and attempt an assignment is about, if those two fields are usable. That is enough
+    to report a failure even when the rest of the assignment cannot be run."""
+    try:
+        return _integer(data, "jobId", 1, None), UUID(data["attemptId"])
+    except (InvalidAssignment, KeyError, TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class WorkerSettings:
     api_url: str

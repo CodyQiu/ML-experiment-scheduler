@@ -123,7 +123,19 @@ level.
 - Every claimed job gets an attempts row for its latest attempt, mirroring the job's state.
   Recovery needs that row: it marks the attempt `EXPIRED` and checks that exactly one row changed.
 
-**Planned (2.3).** `experiments.idempotency_key text UNIQUE` and `experiments.request_fingerprint
+### V3: reported failures (implemented, `V3__reported_failures.sql`)
+
+- **`attempts.retryable boolean`** records the worker's judgment on a reported failure.
+- **`attempts_error_iff_unsuccessful`** replaces V2's weaker constraint. Every `FAILED` or
+  `EXPIRED` attempt must carry an `error_type`, and no other attempt may.
+- **`attempts_retryable_iff_failed`**: a reported failure always says whether a retry was
+  requested.
+- **Backfill:** a `FAILED` attempt without a reason can only come from a job failed by hand under
+  V1. It becomes `UNKNOWN` and `retryable = false`. `MigrationTests` covers this.
+
+### Planned (2.3)
+
+`experiments.idempotency_key text UNIQUE` and `experiments.request_fingerprint
 text`, both set or both null. The key is global in scope, which is enough for a single-user local
 service.
 
@@ -135,9 +147,10 @@ service.
    ▲                 │  │
    │                 │  └──────────────────────────────────────────────────────▶ FAILED
    └─────────────────┘   lease expiry on the final attempt;
-   lease expiry with     non-retryable failure (2.2)
-   attempts left;
-   retryable failure (2.2)
+   lease expiry with     a non-retryable failure; a retryable
+   attempts left;        failure on the final attempt
+   a retryable failure
+   with attempts left
 ```
 
 Every transition is one `UPDATE` whose `WHERE` clause is the guard. The affected-row count decides
@@ -151,7 +164,8 @@ the attempt's row in the same transaction.
 | RUNNING → SUCCEEDED | worker complete | `state = 'RUNNING' AND current_attempt_id = :attempt AND lease_expires_at > now()` | implemented |
 | RUNNING → QUEUED | lease expiry with attempts left | the row is locked by the sweep (`state = 'RUNNING' AND lease_expires_at <= now()`, `SKIP LOCKED`), then `attempt_count < max_attempts` | implemented |
 | RUNNING → FAILED | lease expiry on the final attempt | the same lock, then `attempt_count >= max_attempts` | implemented |
-| RUNNING → QUEUED / FAILED | failure reported by the worker | the running attempt's guard, then the budget | 2.2 |
+| RUNNING → QUEUED | retryable failure with attempts left | the running attempt's guard, and `:retryable AND attempt_count < max_attempts` | implemented |
+| RUNNING → FAILED | non-retryable failure, or a retryable one on the final attempt | the running attempt's guard, and the negation | implemented |
 
 `SUCCEEDED` and `FAILED` are terminal. No statement has a guard that matches a terminal row, so an
 accepted result can never be overwritten.
@@ -182,7 +196,8 @@ accepted result can never be overwritten.
 | `POST /worker/jobs/claim` | Claim the oldest queued job | `200` assignment, `204` no work | `400` | implemented |
 | `POST /worker/jobs/{id}/complete` | Report success | `200` | `400`, `404`, `409` | implemented |
 | `POST /worker/jobs/{id}/heartbeat` | Renew the lease | `200` | `400`, `404`, `409` | implemented |
-| `POST /worker/jobs/{id}/fail` | Report a failure | `200` | `409` | 2.2 |
+| `POST /worker/jobs/{id}/fail` | Report a failure | `200` with the new state | `400`, `404`, `409` | implemented |
+| `GET /jobs/{id}/attempts` | Attempt history | `200` | `404` | implemented |
 | `GET /experiments/{id}/best?limit=N` | Top successful jobs by `valAccuracy` | `200` | `404` | 2.3 |
 
 ### `POST /experiments`
@@ -252,8 +267,13 @@ The mechanism is described under [Transactions, locking, and time](#transactions
    "state": "QUEUED", "attemptCount": 0, "maxAttempts": 3, "workerId": null,
    "valAccuracy": null, "result": null,
    "createdAt": "2026-09-29T06:15:16.186697Z", "startedAt": null, "finishedAt": null,
-   "leaseExpiresAt": null}]}
+   "leaseExpiresAt": null, "lastError": null}]}
 ```
+
+`lastError` is `{attemptNumber, type, message}` from the most recent unsuccessful attempt, or null.
+It stays after a later success, so the list shows at a glance which jobs needed retries and why.
+The query takes it with a `LEFT JOIN LATERAL` that reads each job's attempts newest first through
+the `(job_id, attempt_number)` index.
 
 The list is wrapped in an object so paging or filters can be added without breaking clients.
 Responses never include the attempt id: it is the worker's credential for changing the job.
@@ -315,6 +335,33 @@ The upper bounds also reject non-finite values. JSON has no NaN, but an overflow
 - On either `409`, the worker must discard its result.
 - `404 NOT_FOUND`: no such job.
 - `400`: invalid report. Validation runs before any state is read.
+**Fail.** `POST /worker/jobs/{jobId}/fail`:
+
+```json
+{"attemptId": "8b64bfc6-…", "retryable": false, "errorType": "TRAINING_DIVERGED",
+ "message": "validation loss is nan"}
+```
+
+| Field | Rule |
+|---|---|
+| `attemptId` | required UUID |
+| `retryable` | required boolean. This is the worker's judgment; the budget has the last word |
+| `errorType` | required `UPPER_SNAKE_CASE` code, ≤ 64 characters |
+| `message` | required, ≤ 2000 characters (the worker truncates) |
+
+- The guard is the same as for completion: the job is `RUNNING`, the attempt is current, and its
+  lease is live.
+- `200 {"jobId": 2, "state": "QUEUED"}`: another attempt will run. That happens only when the
+  failure is retryable and attempts remain.
+- `200 {"jobId": 2, "state": "FAILED"}`: the job has ended.
+- `409 LEASE_EXPIRED` or `409 ATTEMPT_NOT_CURRENT`: nothing changed. A late failure report from an
+  expired attempt leaves no trace; recovery records that attempt as `EXPIRED`.
+
+**Attempt history.** `GET /jobs/{id}/attempts` returns
+`{"jobId": 1, "attempts": [{attemptNumber, workerId, status, claimedAt, lastHeartbeatAt, finishedAt,
+errorType, errorMessage, retryable}]}`, oldest first. It deliberately omits attempt ids: a running
+attempt's id is its worker's credential.
+
 - Increment 2.3 adds `409 RESULT_CONFLICT`, and returns `200` with `"replayed": true` for an
   identical retry.
 
@@ -354,7 +401,7 @@ first delivery succeeded gets `409` with `jobState: SUCCEEDED`, and the worker c
 
 - ~~A worker that crashes, or a claim response lost in transit, leaves its job `RUNNING`
   forever.~~ Fixed by R1.
-- Failures cannot be reported yet (2.2). Lease expiry already retries within the budget (R4).
+- ~~Failures cannot be reported.~~ Fixed in 2.2 (`/fail`; R4).
 - Submitting the same batch twice creates two experiments (2.3).
 - A completion retried after a lost response gets `409`, even though its result was stored (2.3).
 
@@ -364,8 +411,8 @@ first delivery succeeded gets `409` with `jobState: SUCCEEDED`, and the worker c
 |---|---|---|---|
 | R1 | A crashed worker's job becomes eligible again | A lease in database time, renewed by heartbeats. A periodic sweep re-queues expired attempts | implemented; tested, and verified live with SIGKILL and `docker pause` |
 | R2 | Recovery is safe with several API instances | The sweep locks rows with `SKIP LOCKED` and re-checks expiry under the lock. No leader election | implemented; 8 concurrent sweeps recover each attempt exactly once |
-| R3 | A stale attempt cannot renew or complete a job, or replace a newer attempt's lease | Guards on `current_attempt_id`, `state`, and `lease_expires_at > now()`. Leases are strict: an expired attempt loses authority even before the sweep runs | implemented, tested (`fail` arrives in 2.2) |
-| R4 | Retries stop at `maxAttempts`, including lease expiry | The sweep fails a job whose final attempt expired; `jobs_attempt_count_within_budget` backs this up | lease-expiry path implemented, tested; reported failures in 2.2 |
+| R3 | A stale attempt cannot renew or complete a job, or replace a newer attempt's lease | Guards on `current_attempt_id`, `state`, and `lease_expires_at > now()`. Leases are strict: an expired attempt loses authority even before the sweep runs | implemented, tested, including `fail` |
+| R4 | Retries stop at `maxAttempts`, however attempts end | The fail guard re-queues only when `retryable AND attempt_count < max_attempts`, and the sweep fails a job whose final attempt expired. `jobs_queued_has_attempts_left` backs both: a mutation that ignored the budget was stopped by this CHECK | implemented; tested through failures alone and through a mix of expiries and failures |
 | R5 | Submissions are idempotent | Unique key, fingerprint, and one transaction | 2.3 |
 | R6 | Repeating a completion is safe | Identical replay → `200`, no mutation. Different payload → `409` | 2.3 |
 | R7 | At most one accepted success per job | The terminal-state guard plus `attempts_one_success_per_job` | implemented, tested |
@@ -460,6 +507,27 @@ that one's.
 The heartbeat (`JobRepository.renewLease`) uses the same guard and sets
 `lease_expires_at = now() + lease`.
 
+**The failure guard** (`JobRepository.markFailed`) checks authority and decides the outcome in one
+statement:
+
+```sql
+UPDATE jobs
+SET state              = CASE WHEN :retry AND attempt_count < max_attempts THEN 'QUEUED' ELSE 'FAILED' END,
+    current_attempt_id = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE current_attempt_id END,
+    …                  -- worker_id, started_at, finished_at likewise
+    lease_expires_at   = NULL
+WHERE id = :jobId AND state = 'RUNNING' AND current_attempt_id = :attemptId AND lease_expires_at > now()
+RETURNING state, attempt_count, max_attempts
+```
+
+- The budget is read under the same row lock that authorizes the write, so no separate read can go
+  stale.
+- PostgreSQL evaluates every `SET` expression against the *old* row. Each `CASE` therefore sees the
+  same `attempt_count`, whatever order the assignments are written in. (MySQL, by contrast,
+  applies single-table assignments left to right.)
+- The same transaction marks the attempt `FAILED`, with `error_type`, `error_message`, and
+  `retryable`.
+
 **Leases.** These are the defaults. They are set in `SchedulerProperties` and overridable with
 environment variables such as `SCHEDULER_LEASE_DURATION`.
 
@@ -514,7 +582,8 @@ exception rolls back all four writes.
   `ATTEMPT_NOT_CURRENT`.
 - **If the completion locks first:** recovery's `SKIP LOCKED` passes over the row, and the result
   stands. The next sweep sees `SUCCEEDED` and ignores it.
-- `CompletionRecoveryRaceTests` forces both orders deterministically. Each side runs in a held
+- `ReportRecoveryRaceTests` forces both orders deterministically, for both kinds of report
+  (completion and non-retryable failure), since they use the same guard. Each side runs in a held
   transaction, the lease is placed between the two start times, and the test waits for
   PostgreSQL's `pg_stat_activity` to report the lock wait.
 - Consequence: an attempt's authority is judged at its transaction's start, so a completion can
@@ -607,6 +676,7 @@ Training runs on one CPU thread with `torch.use_deterministic_algorithms(True)`.
 | Completion fails (connection error, timeout, `5xx`) | Retried, up to 5 attempts with jittered backoff from 0.5 s to 8 s. This is safe because the API's guard accepts at most one result per job, and only from the running attempt, so a duplicate can never overwrite anything |
 | `409` on completion | Definitive. The result is discarded and the loop continues. `jobState: SUCCEEDED` after a retry usually means the earlier delivery succeeded; 2.3 makes that an explicit replay |
 | Heartbeat fails transiently | Sent once. The heartbeat thread tries again at its next interval; two misses in a row still leave the lease alive |
+| Failure report fails transiently | Retried like a completion (5 attempts), and safe for the same reason. If it never gets through, the lease expires and recovery records the attempt `EXPIRED` |
 | `409` on heartbeat | Definitive: the lease is lost. Training stops at the next minibatch and nothing is reported |
 | Other `4xx` | A bug or version skew. Logged and never retried |
 
@@ -657,17 +727,20 @@ Training runs on one CPU thread with `torch.use_deterministic_algorithms(True)`.
 - **Survives an API outage.** Verified: with the API stopped for about 8 s, claims failed at growing
   intervals. When the API came back, the worker resumed and finished a 6-job batch.
 
-**Remaining gap on the worker side (until 2.2).** In these cases the worker simply stops
-heartbeating:
+**How the worker classifies each outcome** (`worker.py`):
 
-- the assignment can't be run (an unknown task or an invalid config),
-- training diverges,
-- training is aborted, or
-- its result can't be delivered after all retries.
+| Outcome | Report | Why |
+|---|---|---|
+| Training finished and the lease is intact | `complete` | |
+| `TrainingDiverged` (a non-finite loss) | `fail`, `TRAINING_DIVERGED`, not retryable | Deterministic for this config and seed: another attempt would diverge the same way. No in-bounds config diverges in practice; this is a safety net |
+| The assignment can't be run (unknown task, invalid config) | `fail`, `INVALID_ASSIGNMENT`, not retryable | Every worker of this version would reject it. If even the job and attempt ids are unusable, nothing can be reported, and the lease expires |
+| Any other exception during training | `fail`, `WORKER_ERROR`, retryable | Unknown cause, so it is retried within the budget. The worker itself keeps running |
+| Aborted by a second stop signal | `fail`, `WORKER_SHUTDOWN`, retryable | Not the job's fault. Reporting hands the job over at once instead of after the lease: verified live, re-queued within 1 s and reclaimed at 4 s |
+| Lease lost (`409`, or self-fenced) | nothing | The attempt no longer has authority to report anything |
 
-The lease then runs out, and the job is retried until `maxAttempts` is used up and it becomes
-`FAILED`. That is bounded, but slow, and it wastes attempts on failures that are deterministic.
-Increment 2.2 lets the worker report them, so a non-retryable failure ends the job at once.
+A shutdown still consumes an attempt from the budget, like any other execution that started.
+Giving it back would mean reusing an attempt number, which `attempts_job_attempt_number_unique`
+forbids.
 
 ## Decision log
 
@@ -702,3 +775,7 @@ Increment 2.2 lets the worker report them, so a non-retryable failure ends the j
 | Heartbeats continue through reporting | A slow, retried report would otherwise let the lease lapse after training succeeded |
 | The worker self-fences after a full lease without a successful renewal | Saves compute during outages. It is measured from the last success's receipt, on the local monotonic clock |
 | Tests turn off the periodic sweep (`scheduler.recovery.enabled=false`) | A background sweep would race tests that expire a lease on purpose. The tests call `RecoveryService` directly |
+| A failure report is one guarded `UPDATE` with `CASE`, not a read followed by a write | The budget and authority are checked under the lock that performs the write |
+| `retryable` comes from the worker; the budget comes from the server | Only the worker knows whether an error is deterministic. Only the server can enforce the limit across workers |
+| Every started execution counts against `maxAttempts`, including shutdowns | A simple, uniform rule, and attempt numbers are never reused |
+| Attempt history at `GET /jobs/{id}/attempts`, plus `lastError` on job responses | Details on demand, while list views still show why a job failed without one request per job. Attempt ids are never exposed |

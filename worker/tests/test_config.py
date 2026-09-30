@@ -5,7 +5,8 @@ from uuid import UUID
 
 import pytest
 
-from scheduler_worker.config import Assignment, InvalidAssignment, MlpConfig, WorkerSettings, default_worker_id
+from scheduler_worker.config import (Assignment, InvalidAssignment, MlpConfig, WorkerSettings, default_worker_id,
+                                     identify)
 
 ASSIGNMENT = {
     "jobId": 17,
@@ -100,3 +101,9 @@ def test_rejects_invalid_settings(env):
 def test_rejects_a_lease_policy_it_cannot_follow(overrides, message):
     with pytest.raises(InvalidAssignment, match=re.escape(message)):
         Assignment.from_json({**ASSIGNMENT, **overrides})
+
+
+def test_identifies_the_job_and_attempt_even_when_the_rest_is_unusable():
+    assert identify({**ASSIGNMENT, "task": "mnist", "config": None}) == (17, UUID(ASSIGNMENT["attemptId"]))
+    assert identify({**ASSIGNMENT, "attemptId": "nope"}) is None
+    assert identify({"attemptId": ASSIGNMENT["attemptId"]}) is None

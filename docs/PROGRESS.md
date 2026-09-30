@@ -8,8 +8,8 @@ _Last updated: 2026-09-29_
 |---|---|---|
 | 1.1–1.3 | MVP: submission API, atomic claims, fenced completion, Python worker, Compose | done |
 | 2.1 | Leases, heartbeats, recovery sweep, strict fencing, attempt history (V2) | done |
-| 2.2 | Failure reports (retryable or not), bounded retries on reported failures, attempt history in the API | next |
-| 2.3 | Idempotent submission, safe repeated completion, best-configurations endpoint | planned |
+| 2.2 | Failure reports (retryable or not), bounded retries on reported failures, attempt history in the API | done |
+| 2.3 | Idempotent submission, safe repeated completion, best-configurations endpoint | next |
 | 2.4 | Scripted kill-a-worker and stale-worker demos | planned |
 | M3 | CI, structured logs, architecture README, recovery demo write-up, benchmarks | planned |
 
@@ -44,9 +44,61 @@ _Last updated: 2026-09-29_
   successful renewal stops training at the next minibatch.
 - **`CLAUDE.md`:** commands, architecture rules, testing conventions, and environment gotchas.
 
+Committed as `84cf4a3` on branch `milestone-2`, covering 1.2 through 2.1.
+
+**2.2**
+
+- **`V3__reported_failures.sql`:**
+  - `attempts.retryable`.
+  - Every `FAILED`/`EXPIRED` attempt must carry an `error_type`, and every `FAILED` attempt a
+    `retryable` flag.
+  - A backfill for V1-era rows.
+- **`POST /worker/jobs/{id}/fail`:** one guarded `UPDATE` that re-queues when the failure is
+  retryable and attempts remain, and otherwise fails the job. The attempt records the error.
+- **`GET /jobs/{id}/attempts`** returns the history without attempt ids. `lastError` appears on
+  every job response, via a `LATERAL` join.
+- **Worker failure reports:**
+  - non-retryable: `TRAINING_DIVERGED`, `INVALID_ASSIGNMENT`;
+  - retryable: `WORKER_ERROR` (the worker survives the exception) and `WORKER_SHUTDOWN` (an
+    immediate handover on a second stop signal).
+
 ## Verified (2026-09-29: macOS arm64, Docker Desktop 29.2.0)
 
-**API: `scripts/mvnw-docker.sh verify` runs 86 tests, 0 failures.** New in 2.1:
+**2.2, API: `scripts/mvnw-docker.sh verify` runs 109 tests, 0 failures.**
+
+- New tests:
+  - retries stop at `maxAttempts` through failures alone, and through a mix of expiries and
+    failures;
+  - a non-retryable failure ends the job at once;
+  - a stale attempt cannot fail its successor;
+  - an expired lease cannot report a failure;
+  - a failure cannot undo a success.
+- The HTTP contract, the attempt history, and `lastError` are covered.
+- The race tests are generalized (`ReportRecoveryRaceTests`): completion and failure, each in both
+  lock orders.
+- V3 schema and migration tests.
+- Mutation checks. The fail guard's lease and attempt checks, its budget condition, and its
+  retryable condition are each caught. Ignoring the budget was stopped by V1's
+  `jobs_queued_has_attempts_left` CHECK.
+
+**2.2, worker: `uv run pytest` runs 61 tests, 0 failures.**
+
+- Covers the classification of each outcome, identity parsing, and `client.fail` with retries and
+  truncation.
+- Mutations are caught: divergence marked retryable, an unreported shutdown, and unexpected errors
+  escaping the loop.
+
+**2.2, live (fresh stack; V1–V3 applied):**
+
+- Two SIGTERMs to the worker training a job:
+  - `WORKER_SHUTDOWN` reported, and the job was re-queued within 1 s instead of after the 30 s
+    lease;
+  - the other worker claimed attempt 2 at 4 s, and it `SUCCEEDED` at 31 s;
+  - the history and `lastError` explain both attempts.
+- A manual non-retryable report (`TRAINING_DIVERGED`) ended its job `FAILED` after 1 of 3 attempts.
+  A duplicate report got `409`, and progress showed `failed: 1`.
+
+**2.1, API: 86 tests at the time.** New in 2.1:
 
 - Heartbeat and strict-lease HTTP tests. An expired lease can neither renew nor complete before
   recovery runs, and a stale attempt cannot touch its successor's lease.
@@ -88,11 +140,9 @@ _Last updated: 2026-09-29_
 
 ## Known limitations (current)
 
-- **Failures can't be reported yet (2.2).** Divergence, an unrunnable assignment, an aborted run,
-  and an undeliverable result all rely on lease expiry. The job is retried until `maxAttempts`,
-  then `FAILED`. That is bounded, but deterministic failures waste attempts, and each costs about
-  35 s.
-- **Attempt history is in the database, not yet in the API.** 2.2 adds it to `GET /jobs/{id}`.
+- **A result or failure report that can't be delivered after its retries** still relies on lease
+  expiry. The attempt is recorded `EXPIRED`, not with the worker's error.
+- **Duplicate failure reports get `409`.** That's harmless: the first one was applied.
 - **Duplicate submissions create duplicate experiments,** and a retried completion gets `409`
   rather than a replay (2.3).
 - **Strictness is bounded by statement duration.** A lease is judged at its transaction's start,
@@ -100,19 +150,19 @@ _Last updated: 2026-09-29_
 - **No best-configurations endpoint** (2.3); rank with `jq`.
 - **Other:** no CI, bodies parsed before size limits, no local JDK.
 
-## Next: increment 2.2 (failures and bounded retries)
+## Next: increment 2.3 (idempotency and ranking)
 
-1. `POST /worker/jobs/{id}/fail` with `{attemptId, retryable, errorType, message}`.
-   - It uses the same guards as completion (state, attempt, live lease).
-   - A retryable failure with attempts left goes back to the queue. Otherwise the job is `FAILED`.
-   - The attempt is recorded `FAILED` with its error.
-2. `GET /jobs/{id}` includes `attempts: [...]` (number, worker, status, times, error) and the
-   latest error.
-3. The worker reports divergence (non-retryable), unrunnable assignments (non-retryable), and
-   unexpected exceptions (retryable), instead of waiting for the lease to run out.
-4. Tests:
-   - retries stop at `maxAttempts` through reported failures, and through a mix of failures and
-     expiries;
-   - a non-retryable failure ends the job at once;
-   - a stale attempt cannot fail a newer attempt;
-   - a failure racing recovery.
+1. **`Idempotency-Key` on `POST /experiments`:**
+   - a canonical fingerprint of the validated request, computed from parsed values with defaults
+     applied;
+   - a unique key column, and `INSERT … ON CONFLICT DO NOTHING` in the submission transaction;
+   - the same key with the same body returns `200` with the original experiment; with a different
+     body, `409 IDEMPOTENCY_KEY_REUSED`.
+2. **Safe repeated completion.** An identical retry from the attempt that succeeded returns `200`
+   with `"replayed": true` and changes nothing. A different payload returns `409 RESULT_CONFLICT`.
+   A late first report stays `LEASE_EXPIRED`.
+3. **`GET /experiments/{id}/best?limit=N`:** successful jobs by `valAccuracy`, descending, with a
+   deterministic tie-break.
+4. **Tests:** concurrent duplicate submissions create one experiment; key reuse with a different
+   payload; JSON key order and number spelling don't change identity; a lost acknowledgement
+   followed by a retry.

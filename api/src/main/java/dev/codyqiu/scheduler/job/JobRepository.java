@@ -24,10 +24,23 @@ import org.springframework.transaction.annotation.Transactional;
 @Repository
 public class JobRepository {
 
+	/**
+	 * Jobs with the reason their latest unsuccessful attempt ended. LATERAL runs the subquery once
+	 * per job row, walking that job's attempts newest first through the (job_id, attempt_number)
+	 * index.
+	 */
 	private static final String SELECT_JOBS = """
-			SELECT id, experiment_id, job_index, seed, config, state, attempt_count, max_attempts,
-			       worker_id, val_accuracy, result, created_at, started_at, finished_at, lease_expires_at
-			FROM jobs
+			SELECT j.id, j.experiment_id, j.job_index, j.seed, j.config, j.state, j.attempt_count, j.max_attempts,
+			       j.worker_id, j.val_accuracy, j.result, j.created_at, j.started_at, j.finished_at,
+			       j.lease_expires_at, e.attempt_number AS error_attempt, e.error_type, e.error_message
+			FROM jobs j
+			LEFT JOIN LATERAL (
+			    SELECT attempt_number, error_type, error_message
+			    FROM attempts a
+			    WHERE a.job_id = j.id AND a.error_type IS NOT NULL
+			    ORDER BY a.attempt_number DESC
+			    LIMIT 1
+			) e ON true
 			""";
 
 	private final JdbcClient jdbc;
@@ -164,6 +177,38 @@ public class JobRepository {
 		return updated == 1;
 	}
 
+	/**
+	 * Ends the attempt with a reported failure if, and only if, it is the running attempt of the job
+	 * with a live lease: the same guard as completion. One statement both checks and decides. A
+	 * retryable failure with attempts left returns the job to the queue; anything else fails it for
+	 * good. (PostgreSQL evaluates every SET expression against the old row, so each CASE sees the
+	 * same attempt_count.)
+	 * @return the job's new state, or empty if the report was rejected
+	 */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public Optional<FailedAttempt> markFailed(long jobId, UUID attemptId, boolean retryable) {
+		return jdbc.sql("""
+				UPDATE jobs
+				SET state              = CASE WHEN :retry AND attempt_count < max_attempts THEN 'QUEUED' ELSE 'FAILED' END,
+				    current_attempt_id = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE current_attempt_id END,
+				    worker_id          = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE worker_id END,
+				    started_at         = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE started_at END,
+				    finished_at        = CASE WHEN :retry AND attempt_count < max_attempts THEN NULL ELSE now() END,
+				    lease_expires_at   = NULL
+				WHERE id = :jobId
+				  AND state = 'RUNNING'
+				  AND current_attempt_id = :attemptId
+				  AND lease_expires_at > now()
+				RETURNING state, attempt_count, max_attempts
+				""")
+			.param("retry", retryable)
+			.param("jobId", jobId)
+			.param("attemptId", attemptId)
+			.query((rs, rowNum) -> new FailedAttempt(JobState.valueOf(rs.getString("state")),
+					rs.getInt("attempt_count"), rs.getInt("max_attempts")))
+			.optional();
+	}
+
 	/** Explains an already-rejected request by {@code attemptId}. Never used to decide a write. */
 	public Optional<AttemptStanding> findStanding(long jobId, UUID attemptId) {
 		return jdbc.sql("""
@@ -232,15 +277,19 @@ public class JobRepository {
 			.update();
 	}
 
+	public boolean exists(long id) {
+		return jdbc.sql("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = :id)").param("id", id).query(Boolean.class).single();
+	}
+
 	public Optional<JobResponse> findById(long id) {
-		return jdbc.sql(SELECT_JOBS + "WHERE id = :id")
+		return jdbc.sql(SELECT_JOBS + "WHERE j.id = :id")
 			.param("id", id)
 			.query(this::mapJob)
 			.optional();
 	}
 
 	public List<JobResponse> findByExperimentId(long experimentId) {
-		return jdbc.sql(SELECT_JOBS + "WHERE experiment_id = :experimentId ORDER BY job_index")
+		return jdbc.sql(SELECT_JOBS + "WHERE j.experiment_id = :experimentId ORDER BY j.job_index")
 			.param("experimentId", experimentId)
 			.query(this::mapJob)
 			.list();
@@ -263,7 +312,10 @@ public class JobRepository {
 				instant(rs, "created_at"),
 				instant(rs, "started_at"),
 				instant(rs, "finished_at"),
-				instant(rs, "lease_expires_at"));
+				instant(rs, "lease_expires_at"),
+				(rs.getString("error_type") != null)
+						? new JobError(rs.getInt("error_attempt"), rs.getString("error_type"), rs.getString("error_message"))
+						: null);
 	}
 
 	private static Instant instant(ResultSet rs, String column) throws SQLException {

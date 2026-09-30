@@ -19,6 +19,8 @@ from .backoff import Backoff
 
 log = logging.getLogger(__name__)
 
+MAX_ERROR_MESSAGE = 2000  # the API rejects longer failure messages
+
 
 class ApiUnavailable(Exception):
     """No definitive answer: connection errors, timeouts, or 5xx responses, after any retries."""
@@ -75,6 +77,21 @@ class ApiClient:
         response = self._post(f"/worker/jobs/{job_id}/complete", body, attempts=self._report_attempts)
         if response.status_code == 200:
             return
+        if response.status_code == 409:
+            raise _rejection(job_id, response)
+        raise ApiError(_describe(response))
+
+    def fail(self, job_id: int, attempt_id: UUID, *, retryable: bool, error_type: str, message: str) -> str:
+        """Reports that the attempt failed; returns the job's new state (QUEUED or FAILED).
+
+        Retried like a completion, and safe to retry for the same reason: only the running attempt
+        can end the job, so a duplicate delivery changes nothing.
+        """
+        body = {"attemptId": str(attempt_id), "retryable": retryable, "errorType": error_type,
+                "message": message[:MAX_ERROR_MESSAGE]}
+        response = self._post(f"/worker/jobs/{job_id}/fail", body, attempts=self._report_attempts)
+        if response.status_code == 200:
+            return response.json()["state"]
         if response.status_code == 409:
             raise _rejection(job_id, response)
         raise ApiError(_describe(response))

@@ -31,6 +31,7 @@ class FakeApi:
         self.complete_error = complete_error
         self.heartbeats = 0
         self.heartbeat_error = heartbeat_error
+        self.failures = []
         self.worker = None
 
     def claim(self, worker_id):
@@ -52,6 +53,10 @@ class FakeApi:
         self.heartbeats += 1
         if self.heartbeat_error:
             raise self.heartbeat_error
+
+    def fail(self, job_id, attempt_id, *, retryable, error_type, message):
+        self.failures.append((job_id, error_type, retryable))
+        return "QUEUED" if retryable else "FAILED"
 
 
 def make_worker(api, train=None):
@@ -118,14 +123,53 @@ def test_a_rejected_result_is_discarded_and_the_loop_continues():
     assert completed_jobs(api) == [1, 2]
 
 
-def test_an_assignment_it_cannot_run_is_neither_trained_nor_reported():
+def test_an_assignment_it_cannot_run_is_reported_as_a_non_retryable_failure_without_training():
     trained = []
     api = FakeApi(assignment(1, task_id="mnist"), assignment(2))
     worker, _ = make_worker(api, train=lambda config, seed, should_stop: trained.append(seed) or METRICS)
 
     worker.run()
 
+    assert api.failures == [(1, "INVALID_ASSIGNMENT", False)]
     assert len(trained) == 1
+    assert completed_jobs(api) == [2]
+
+
+def test_an_assignment_without_a_usable_attempt_id_cannot_even_be_reported():
+    api = FakeApi({**assignment(1), "attemptId": "not-a-uuid"})
+    worker, _ = make_worker(api)
+
+    worker.run()
+
+    assert api.failures == [] and api.completed == []
+
+
+def test_a_diverged_run_is_reported_as_a_non_retryable_failure():
+    def train(config, seed, should_stop):
+        raise task.TrainingDiverged("validation loss is nan")
+
+    api = FakeApi(assignment(1))
+    worker, _ = make_worker(api, train=train)
+    worker.run()
+
+    assert api.failures == [(1, "TRAINING_DIVERGED", False)]
+    assert api.completed == []
+
+
+def test_an_unexpected_error_is_reported_as_retryable_and_the_worker_keeps_going():
+    calls = []
+
+    def train(config, seed, should_stop):
+        calls.append(seed)
+        if len(calls) == 1:
+            raise RuntimeError("out of scratch space")
+        return METRICS
+
+    api = FakeApi(assignment(1), assignment(2))
+    worker, _ = make_worker(api, train=train)
+    worker.run()
+
+    assert api.failures == [(1, "WORKER_ERROR", True)]
     assert completed_jobs(api) == [2]
 
 
@@ -144,7 +188,7 @@ def test_first_stop_signal_finishes_and_reports_the_current_job_then_exits():
     assert api.claim_calls == 1
 
 
-def test_second_stop_signal_aborts_training_without_reporting():
+def test_second_stop_signal_aborts_training_and_hands_the_job_back():
     api = FakeApi(assignment(1), assignment(2))
 
     def train(config, seed, should_stop):
@@ -158,6 +202,8 @@ def test_second_stop_signal_aborts_training_without_reporting():
     worker.run()
 
     assert api.completed == []
+    # Reported as retryable, so the job is re-queued at once instead of after its lease runs out.
+    assert api.failures == [(1, "WORKER_SHUTDOWN", True)]
     assert api.claim_calls == 1
 
 
@@ -207,7 +253,7 @@ def test_losing_the_lease_stops_training_and_nothing_is_reported():
 
     worker.run()
 
-    assert api.completed == []
+    assert api.completed == [] and api.failures == []
     assert time.monotonic() - started < 2  # stopped by the lost lease, not by running out the loop
 
 

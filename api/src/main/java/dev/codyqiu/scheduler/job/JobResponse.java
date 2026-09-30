@@ -24,5 +24,6 @@ public record JobResponse(
 		Instant createdAt,
 		Instant startedAt,
 		Instant finishedAt,
-		Instant leaseExpiresAt) {
+		Instant leaseExpiresAt,
+		JobError lastError) {
 }

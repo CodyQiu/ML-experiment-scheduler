@@ -89,6 +89,28 @@ class JobSchemaInvariantTests extends IntegrationTest {
 			.hasMessageContaining(index);
 	}
 
+	@ParameterizedTest(name = "{0}")
+	@MethodSource
+	void databaseRejectsUnexplainedAttempts(String violation, String constraint, String values) {
+		assertThatThrownBy(() -> jdbc.sql("""
+				INSERT INTO attempts (id, job_id, attempt_number, worker_id, claimed_at, finished_at, status,
+				                      error_type, retryable)
+				VALUES (gen_random_uuid(), 1, 1, 'worker-a', now(), now(), %s)
+				""".formatted(values)).update())
+			.isInstanceOf(DataIntegrityViolationException.class)
+			.hasMessageContaining(constraint);
+	}
+
+	static Stream<Arguments> databaseRejectsUnexplainedAttempts() {
+		return Stream.of(
+				Arguments.of("failed without a reason", "attempts_error_iff_unsuccessful", "'FAILED', NULL, true"),
+				Arguments.of("expired without a reason", "attempts_error_iff_unsuccessful", "'EXPIRED', NULL, NULL"),
+				Arguments.of("succeeded with an error", "attempts_error_iff_unsuccessful", "'SUCCEEDED', 'WORKER_ERROR', NULL"),
+				Arguments.of("failed without saying whether to retry", "attempts_retryable_iff_failed",
+						"'FAILED', 'WORKER_ERROR', NULL"),
+				Arguments.of("expired with a retry flag", "attempts_retryable_iff_failed", "'EXPIRED', 'LEASE_EXPIRED', true"));
+	}
+
 	static Stream<Arguments> aJobHasAtMostOneRunningAndOneSucceededAttempt() {
 		return Stream.of(Arguments.of("RUNNING", "attempts_one_running_per_job"),
 				Arguments.of("SUCCEEDED", "attempts_one_success_per_job"));

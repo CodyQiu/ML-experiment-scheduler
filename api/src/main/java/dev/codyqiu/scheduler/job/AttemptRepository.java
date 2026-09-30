@@ -1,5 +1,9 @@
 package dev.codyqiu.scheduler.job;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -53,6 +57,21 @@ public class AttemptRepository {
 	}
 
 	@Transactional(propagation = Propagation.MANDATORY)
+	public void markFailed(UUID attemptId, String errorType, String errorMessage, boolean retryable) {
+		requireRows(1, jdbc.sql("""
+				UPDATE attempts
+				SET status = 'FAILED', finished_at = now(), error_type = :errorType, error_message = :errorMessage,
+				    retryable = :retryable
+				WHERE id = :id AND status = 'RUNNING'
+				""")
+			.param("errorType", errorType)
+			.param("errorMessage", errorMessage)
+			.param("retryable", retryable)
+			.param("id", attemptId)
+			.update(), attemptId);
+	}
+
+	@Transactional(propagation = Propagation.MANDATORY)
 	public void markExpired(List<UUID> attemptIds) {
 		requireRows(attemptIds.size(), jdbc.sql("""
 				UPDATE attempts
@@ -62,6 +81,27 @@ public class AttemptRepository {
 				""")
 			.param("ids", attemptIds)
 			.update(), attemptIds);
+	}
+
+	public List<AttemptResponse> findByJobId(long jobId) {
+		return jdbc.sql("""
+				SELECT attempt_number, worker_id, status, claimed_at, last_heartbeat_at, finished_at,
+				       error_type, error_message, retryable
+				FROM attempts
+				WHERE job_id = :jobId
+				ORDER BY attempt_number
+				""")
+			.param("jobId", jobId)
+			.query((rs, rowNum) -> new AttemptResponse(rs.getInt("attempt_number"), rs.getString("worker_id"),
+					AttemptStatus.valueOf(rs.getString("status")), instant(rs, "claimed_at"),
+					instant(rs, "last_heartbeat_at"), instant(rs, "finished_at"), rs.getString("error_type"),
+					rs.getString("error_message"), rs.getObject("retryable", Boolean.class)))
+			.list();
+	}
+
+	private static Instant instant(ResultSet rs, String column) throws SQLException {
+		OffsetDateTime value = rs.getObject(column, OffsetDateTime.class);
+		return (value != null) ? value.toInstant() : null;
 	}
 
 	private static void requireRows(int expected, int actual, Object attempts) {
