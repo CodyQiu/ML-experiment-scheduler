@@ -12,8 +12,11 @@ submission, safe repeated completion, and a checked end-to-end demo. Milestone 3
 - A CI workflow runs both test suites and the demo on every push. It was replayed locally but has
   not yet run on GitHub.
 - Both services log JSON lines that share ids and event names.
+- `scripts/benchmark.sh` measures dispatch, submission, and training throughput, and checks
+  correctness while it does. The observed numbers and the method are in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-Benchmarks are next.
+The architecture README is next.
 
 ## See it handle failure
 
@@ -144,7 +147,9 @@ api/            Spring Boot service: REST API, scheduling rules, all database ac
 worker/         Python worker: claim → train (PyTorch, CPU) → report
   scheduler_worker/   task.py (dataset, model, metrics), client.py (HTTP), worker.py (loop)
 compose.yaml    Local stack
-docs/           DESIGN.md (schema, lifecycle, API contract, guarantees, worker), PROGRESS.md
+docs/           DESIGN.md (schema, lifecycle, API contract, guarantees, worker), PROGRESS.md,
+                BENCHMARKS.md (method and results), benchmarks/ (each run's generated data)
 examples/       Sample request bodies
-scripts/        demo.sh (checked end-to-end demo), make_sweep.py (grid sweeps), mvnw-docker.sh
+scripts/        demo.sh (checked end-to-end demo), benchmark.sh and bench/ (measurements),
+                make_sweep.py (grid sweeps), mvnw-docker.sh
 ```

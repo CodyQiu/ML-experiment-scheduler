@@ -1,0 +1,1248 @@
+{
+ "runId": "20260930T161444Z",
+ "finishedAt": "2026-09-30T16:22:07Z",
+ "environment": {
+  "host": {
+   "cpu": "Apple M4 Pro",
+   "cores": 12,
+   "performanceCores": 8,
+   "efficiencyCores": 4,
+   "memoryBytes": 25769803776,
+   "os": "macOS 26.6.2",
+   "power": "Battery Power",
+   "lowPowerMode": false,
+   "loadAverage1m": 5.88
+  },
+  "docker": {
+   "server": "29.2.0",
+   "os": "Docker Desktop",
+   "kernel": "6.12.67-linuxkit",
+   "cpus": 12,
+   "memoryBytes": 8217034752,
+   "compose": "5.0.2"
+  },
+  "otherContainers": {
+   "running": 23,
+   "cpuPercent": 37.2
+  },
+  "code": {
+   "commit": "3033c08",
+   "systemUnderTestChanged": false
+  },
+  "postgres": {
+   "version": "18.6 (Debian 18.6-1.pgdg13+2)",
+   "synchronousCommit": "on",
+   "fsync": "on",
+   "walSyncMethod": "fdatasync",
+   "sharedBuffers": "128MB",
+   "maxConnections": 100
+  },
+  "limits": {
+   "apiCpus": null,
+   "postgresCpus": null
+  },
+  "settings": {
+   "apiConnectionPool": 10,
+   "apiLogLevel": "INFO"
+  },
+  "parameters": {
+   "reps": 3,
+   "dispatchConcurrency": [
+    1,
+    2,
+    4,
+    8,
+    16
+   ],
+   "dispatchWarmupJobs": 500,
+   "dispatchMeasuredJobs": 5000,
+   "submitSizes": [
+    1,
+    100,
+    500
+   ],
+   "submitRequests": 30,
+   "baselineClients": [
+    1,
+    16
+   ],
+   "baselineRequestsPerClient": 2000,
+   "trainingWorkers": [
+    1,
+    2,
+    4
+   ],
+   "trainingBatch": "scripts/make_sweep.py --seeds 2",
+   "trainingWarmupJobsPerWorker": 10
+  }
+ },
+ "connections": {
+  "apiDatabaseConnections": 10
+ },
+ "flush": {
+  "method": "fdatasync",
+  "write": "one 8 kB write",
+  "opsPerSecond": 10484.613,
+  "microsecondsPerOp": 95
+ },
+ "dispatch": [
+  {
+   "concurrency": 1,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 8.650139837,
+   "jobsPerSecond": 578.0253376498104,
+   "claim": {
+    "count": 5000,
+    "meanMs": 0.8860493706,
+    "p50Ms": 0.820291,
+    "p90Ms": 1.09875,
+    "p99Ms": 1.777084,
+    "maxMs": 6.305875
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 0.8178555479999999,
+    "p50Ms": 0.753875,
+    "p90Ms": 0.978959,
+    "p99Ms": 1.6295,
+    "maxMs": 21.93175
+   },
+   "errors": {},
+   "wallSeconds": 9.786377254,
+   "clientCpuSeconds": 1.560115475,
+   "clientCores": 0.159417058479156,
+   "rep": 1,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 7.321462,
+    "postgres": 3.307323
+   }
+  },
+  {
+   "concurrency": 1,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 7.829130836,
+   "jobsPerSecond": 638.6404959550481,
+   "claim": {
+    "count": 5000,
+    "meanMs": 0.8066702698,
+    "p50Ms": 0.7745,
+    "p90Ms": 0.909208,
+    "p99Ms": 1.234166,
+    "maxMs": 12.273583
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 0.7355672395999999,
+    "p50Ms": 0.708833,
+    "p90Ms": 0.811833,
+    "p99Ms": 1.167125,
+    "maxMs": 5.523625
+   },
+   "errors": {},
+   "wallSeconds": 8.627742003,
+   "clientCpuSeconds": 1.391989835,
+   "clientCores": 0.16133883402122867,
+   "rep": 2,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.057191,
+    "postgres": 2.968545
+   }
+  },
+  {
+   "concurrency": 1,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 8.677532795,
+   "jobsPerSecond": 576.2006457504838,
+   "claim": {
+    "count": 5000,
+    "meanMs": 0.8117335412,
+    "p50Ms": 0.771458,
+    "p90Ms": 0.9245,
+    "p99Ms": 1.417417,
+    "maxMs": 8.997709
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 0.899564283,
+    "p50Ms": 0.87825,
+    "p90Ms": 1.037209,
+    "p99Ms": 1.438083,
+    "maxMs": 14.096792
+   },
+   "errors": {},
+   "wallSeconds": 9.496445546,
+   "clientCpuSeconds": 1.4241883059999998,
+   "clientCores": 0.14997067051049245,
+   "rep": 3,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.104737,
+    "postgres": 3.737812
+   }
+  },
+  {
+   "concurrency": 16,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 1.685091792,
+   "jobsPerSecond": 2967.1974095046808,
+   "claim": {
+    "count": 5000,
+    "meanMs": 2.7229621431999997,
+    "p50Ms": 2.585917,
+    "p90Ms": 3.772667,
+    "p99Ms": 5.700417,
+    "maxMs": 13.395167
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 2.6119790356,
+    "p50Ms": 2.473958,
+    "p90Ms": 3.607084,
+    "p99Ms": 5.598708,
+    "maxMs": 13.172292
+   },
+   "errors": {},
+   "wallSeconds": 1.870679876,
+   "clientCpuSeconds": 1.9538790529999999,
+   "clientCores": 1.0444753685905368,
+   "rep": 1,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 4.433796,
+    "postgres": 3.789381
+   }
+  },
+  {
+   "concurrency": 16,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 1.722997084,
+   "jobsPerSecond": 2901.9201752752356,
+   "claim": {
+    "count": 5000,
+    "meanMs": 2.7834803714,
+    "p50Ms": 2.552209,
+    "p90Ms": 3.763125,
+    "p99Ms": 5.640625,
+    "maxMs": 63.916459
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 2.6681290071999997,
+    "p50Ms": 2.463459,
+    "p90Ms": 3.564583,
+    "p99Ms": 5.59025,
+    "maxMs": 64.615001
+   },
+   "errors": {},
+   "wallSeconds": 1.897364292,
+   "clientCpuSeconds": 1.945766782,
+   "clientCores": 1.0255103831162433,
+   "rep": 2,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.848833,
+    "postgres": 3.768483
+   }
+  },
+  {
+   "concurrency": 16,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 1.673579542,
+   "jobsPerSecond": 2987.6082220895123,
+   "claim": {
+    "count": 5000,
+    "meanMs": 2.706746358,
+    "p50Ms": 2.555666,
+    "p90Ms": 3.6755,
+    "p99Ms": 5.924833,
+    "maxMs": 16.810541
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 2.592619339,
+    "p50Ms": 2.429417,
+    "p90Ms": 3.60125,
+    "p99Ms": 5.87875,
+    "maxMs": 16.028208
+   },
+   "errors": {},
+   "wallSeconds": 1.838110001,
+   "clientCpuSeconds": 1.898369897,
+   "clientCores": 1.0327836179375645,
+   "rep": 3,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.958925,
+    "postgres": 3.696001
+   }
+  },
+  {
+   "concurrency": 2,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 5.244782461,
+   "jobsPerSecond": 953.3283862924358,
+   "claim": {
+    "count": 5000,
+    "meanMs": 0.9930901984,
+    "p50Ms": 0.957417,
+    "p90Ms": 1.143375,
+    "p99Ms": 1.74875,
+    "maxMs": 5.219416
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 1.07973027,
+    "p50Ms": 1.039625,
+    "p90Ms": 1.218959,
+    "p99Ms": 1.817375,
+    "maxMs": 18.448958
+   },
+   "errors": {},
+   "wallSeconds": 5.756253086,
+   "clientCpuSeconds": 1.527717841,
+   "clientCores": 0.2654014370416791,
+   "rep": 1,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.705448,
+    "postgres": 4.286522
+   }
+  },
+  {
+   "concurrency": 2,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 4.888383085,
+   "jobsPerSecond": 1022.8330949230424,
+   "claim": {
+    "count": 5000,
+    "meanMs": 0.9993072735999999,
+    "p50Ms": 0.95875,
+    "p90Ms": 1.142583,
+    "p99Ms": 1.672583,
+    "maxMs": 7.1415
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 0.9303250216,
+    "p50Ms": 0.895583,
+    "p90Ms": 1.053041,
+    "p99Ms": 1.571291,
+    "maxMs": 6.290458
+   },
+   "errors": {},
+   "wallSeconds": 5.409884753,
+   "clientCpuSeconds": 1.56522478,
+   "clientCores": 0.2893268251476188,
+   "rep": 2,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.70475,
+    "postgres": 3.63533
+   }
+  },
+  {
+   "concurrency": 2,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 4.791849419,
+   "jobsPerSecond": 1043.438464525757,
+   "claim": {
+    "count": 5000,
+    "meanMs": 0.9783935206000001,
+    "p50Ms": 0.946292,
+    "p90Ms": 1.104209,
+    "p99Ms": 1.457541,
+    "maxMs": 4.245083
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 0.9134015598,
+    "p50Ms": 0.889,
+    "p90Ms": 1.026458,
+    "p99Ms": 1.36325,
+    "maxMs": 3.783333
+   },
+   "errors": {},
+   "wallSeconds": 5.330146711,
+   "clientCpuSeconds": 1.519752961,
+   "clientCores": 0.2851240394309664,
+   "rep": 3,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.681046,
+    "postgres": 3.531428
+   }
+  },
+  {
+   "concurrency": 4,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 3.21209696,
+   "jobsPerSecond": 1556.6155263258306,
+   "claim": {
+    "count": 5000,
+    "meanMs": 1.3049665441999998,
+    "p50Ms": 1.269459,
+    "p90Ms": 1.566667,
+    "p99Ms": 2.154167,
+    "maxMs": 5.865625
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 1.236623437,
+    "p50Ms": 1.202167,
+    "p90Ms": 1.494375,
+    "p99Ms": 1.959458,
+    "maxMs": 4.323334
+   },
+   "errors": {},
+   "wallSeconds": 3.546647419,
+   "clientCpuSeconds": 1.679184486,
+   "clientCores": 0.47345684180624215,
+   "rep": 1,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 4.329904,
+    "postgres": 4.101585
+   }
+  },
+  {
+   "concurrency": 4,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 3.286559377,
+   "jobsPerSecond": 1521.3478371913802,
+   "claim": {
+    "count": 5000,
+    "meanMs": 1.33370521,
+    "p50Ms": 1.29275,
+    "p90Ms": 1.616708,
+    "p99Ms": 2.31275,
+    "maxMs": 4.793042
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 1.2656420034,
+    "p50Ms": 1.226208,
+    "p90Ms": 1.55075,
+    "p99Ms": 2.113292,
+    "maxMs": 4.533417
+   },
+   "errors": {},
+   "wallSeconds": 3.626111043,
+   "clientCpuSeconds": 1.759240737,
+   "clientCores": 0.4851590908657124,
+   "rep": 2,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 4.276501,
+    "postgres": 4.22594
+   }
+  },
+  {
+   "concurrency": 4,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 3.23779796,
+   "jobsPerSecond": 1544.2594200658525,
+   "claim": {
+    "count": 5000,
+    "meanMs": 1.3082658656,
+    "p50Ms": 1.257167,
+    "p90Ms": 1.561334,
+    "p99Ms": 2.591416,
+    "maxMs": 6.263833
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 1.2541021846,
+    "p50Ms": 1.203916,
+    "p90Ms": 1.486792,
+    "p99Ms": 2.31075,
+    "maxMs": 15.048084
+   },
+   "errors": {},
+   "wallSeconds": 3.580738377,
+   "clientCpuSeconds": 1.696545306,
+   "clientCores": 0.47379761584854824,
+   "rep": 3,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 4.228904,
+    "postgres": 4.101911
+   }
+  },
+  {
+   "concurrency": 8,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 2.017013001,
+   "jobsPerSecond": 2478.9131242689496,
+   "claim": {
+    "count": 5000,
+    "meanMs": 1.6287233404,
+    "p50Ms": 1.574417,
+    "p90Ms": 2.075292,
+    "p99Ms": 3.082667,
+    "maxMs": 7.808709
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 1.5636273608,
+    "p50Ms": 1.507959,
+    "p90Ms": 2.0025,
+    "p99Ms": 3.117083,
+    "maxMs": 8.634041
+   },
+   "errors": {},
+   "wallSeconds": 2.242657834,
+   "clientCpuSeconds": 1.786032724,
+   "clientCores": 0.7963910931586187,
+   "rep": 1,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.778237,
+    "postgres": 3.879373
+   }
+  },
+  {
+   "concurrency": 8,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 2.064685668,
+   "jobsPerSecond": 2421.6761308966475,
+   "claim": {
+    "count": 5000,
+    "meanMs": 1.6637259014,
+    "p50Ms": 1.594167,
+    "p90Ms": 2.093333,
+    "p99Ms": 3.374375,
+    "maxMs": 15.551542
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 1.6040000086000001,
+    "p50Ms": 1.540208,
+    "p90Ms": 2.03725,
+    "p99Ms": 3.095625,
+    "maxMs": 10.354125
+   },
+   "errors": {},
+   "wallSeconds": 2.284422043,
+   "clientCpuSeconds": 1.798511845,
+   "clientCores": 0.7872940337408572,
+   "rep": 2,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.87712,
+    "postgres": 4.04426
+   }
+  },
+  {
+   "concurrency": 8,
+   "claimed": 5500,
+   "completed": 5500,
+   "measuredJobs": 5000,
+   "measuredSeconds": 2.05862046,
+   "jobsPerSecond": 2428.8109912207906,
+   "claim": {
+    "count": 5000,
+    "meanMs": 1.6602882849999998,
+    "p50Ms": 1.584958,
+    "p90Ms": 2.074209,
+    "p99Ms": 3.657417,
+    "maxMs": 12.451333
+   },
+   "complete": {
+    "count": 5000,
+    "meanMs": 1.5992471384,
+    "p50Ms": 1.534875,
+    "p90Ms": 2.037834,
+    "p99Ms": 3.438083,
+    "maxMs": 11.951125
+   },
+   "errors": {},
+   "wallSeconds": 2.294178876,
+   "clientCpuSeconds": 1.793561111,
+   "clientCores": 0.7817878238540629,
+   "rep": 3,
+   "invariants": {
+    "jobs": 5500,
+    "succeeded": 5500,
+    "maxAttemptCount": 1,
+    "attempts": 5500,
+    "succeededAttempts": 5500,
+    "ok": true
+   },
+   "cpuSeconds": {
+    "api": 3.850779,
+    "postgres": 3.969002
+   }
+  }
+ ],
+ "baseline": [
+  {
+   "concurrency": 1,
+   "requests": 2000,
+   "requestsPerSecond": 5341.946331468438,
+   "latency": {
+    "count": 2000,
+    "meanMs": 0.185880176,
+    "p50Ms": 0.16875,
+    "p90Ms": 0.23275,
+    "p99Ms": 0.425167,
+    "maxMs": 1.452916
+   },
+   "errors": {},
+   "clientCores": 0.44661442198638274,
+   "rep": 1
+  },
+  {
+   "concurrency": 1,
+   "requests": 2000,
+   "requestsPerSecond": 5854.80307918731,
+   "latency": {
+    "count": 2000,
+    "meanMs": 0.1696524935,
+    "p50Ms": 0.160959,
+    "p90Ms": 0.182875,
+    "p99Ms": 0.392833,
+    "maxMs": 2.644542
+   },
+   "errors": {},
+   "clientCores": 0.4805685277256029,
+   "rep": 2
+  },
+  {
+   "concurrency": 1,
+   "requests": 2000,
+   "requestsPerSecond": 6019.8436561120725,
+   "latency": {
+    "count": 2000,
+    "meanMs": 0.1650410965,
+    "p50Ms": 0.157333,
+    "p90Ms": 0.172625,
+    "p99Ms": 0.396,
+    "maxMs": 1.893333
+   },
+   "errors": {},
+   "clientCores": 0.4778111241666136,
+   "rep": 3
+  },
+  {
+   "concurrency": 16,
+   "requests": 32000,
+   "requestsPerSecond": 45417.259497326966,
+   "latency": {
+    "count": 32000,
+    "meanMs": 0.34193780109375,
+    "p50Ms": 0.302584,
+    "p90Ms": 0.536,
+    "p99Ms": 1.0335,
+    "maxMs": 4.124666
+   },
+   "errors": {},
+   "clientCores": 4.511240051436238,
+   "rep": 1
+  },
+  {
+   "concurrency": 16,
+   "requests": 32000,
+   "requestsPerSecond": 47434.39518898188,
+   "latency": {
+    "count": 32000,
+    "meanMs": 0.33231567906250004,
+    "p50Ms": 0.290458,
+    "p90Ms": 0.505625,
+    "p99Ms": 0.986708,
+    "maxMs": 12.884
+   },
+   "errors": {},
+   "clientCores": 4.612270413247072,
+   "rep": 2
+  },
+  {
+   "concurrency": 16,
+   "requests": 32000,
+   "requestsPerSecond": 47925.06908260175,
+   "latency": {
+    "count": 32000,
+    "meanMs": 0.32777082,
+    "p50Ms": 0.292333,
+    "p90Ms": 0.506417,
+    "p99Ms": 0.869792,
+    "maxMs": 8.766833
+   },
+   "errors": {},
+   "clientCores": 4.775810844580782,
+   "rep": 3
+  }
+ ],
+ "submit": [
+  {
+   "size": 1,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 1.5752581666666667,
+    "p50Ms": 1.46925,
+    "p90Ms": 2.028875,
+    "p99Ms": 2.255125,
+    "maxMs": 2.255125
+   },
+   "rep": 1
+  },
+  {
+   "size": 1,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 3.5246264,
+    "p50Ms": 2.84175,
+    "p90Ms": 5.904791,
+    "p99Ms": 10.452708,
+    "maxMs": 10.452708
+   },
+   "rep": 2
+  },
+  {
+   "size": 1,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 1.6001695,
+    "p50Ms": 1.334666,
+    "p90Ms": 2.594583,
+    "p99Ms": 3.205875,
+    "maxMs": 3.205875
+   },
+   "rep": 3
+  },
+  {
+   "size": 100,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 8.013388966666668,
+    "p50Ms": 7.829625,
+    "p90Ms": 8.904042,
+    "p99Ms": 9.163875,
+    "maxMs": 9.163875
+   },
+   "rep": 1
+  },
+  {
+   "size": 100,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 8.2480015,
+    "p50Ms": 8.050209,
+    "p90Ms": 8.857708,
+    "p99Ms": 10.178125,
+    "maxMs": 10.178125
+   },
+   "rep": 2
+  },
+  {
+   "size": 100,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 7.720558400000001,
+    "p50Ms": 7.482459,
+    "p90Ms": 8.256916,
+    "p99Ms": 10.661584,
+    "maxMs": 10.661584
+   },
+   "rep": 3
+  },
+  {
+   "size": 500,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 32.374941766666666,
+    "p50Ms": 31.741208,
+    "p90Ms": 33.859833,
+    "p99Ms": 40.043583,
+    "maxMs": 40.043583
+   },
+   "rep": 1
+  },
+  {
+   "size": 500,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 36.011736133333336,
+    "p50Ms": 33.313292,
+    "p90Ms": 42.420166,
+    "p99Ms": 64.901458,
+    "maxMs": 64.901458
+   },
+   "rep": 2
+  },
+  {
+   "size": 500,
+   "requests": 30,
+   "warmup": 3,
+   "latency": {
+    "count": 30,
+    "meanMs": 32.28227773333334,
+    "p50Ms": 31.353125,
+    "p90Ms": 33.17025,
+    "p99Ms": 50.360792,
+    "maxMs": 50.360792
+   },
+   "rep": 3
+  }
+ ],
+ "training": [
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 10,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 37.112278,
+   "jobsPerSecond": 5.38905210830766,
+   "trainingSecondsTotal": 35.5650966319954,
+   "trainingSeconds": {
+    "p50": 0.16232533349830192,
+    "min": 0.10365879099845188,
+    "max": 0.3728863750002347
+   },
+   "workers": [
+    "32f378fbcbc4-1"
+   ],
+   "workerCount": 1,
+   "rep": 1,
+   "workerCpuLimits": [
+    1
+   ],
+   "workerTorchThreads": [
+    1
+   ],
+   "cpuSeconds": {
+    "api": 1.313381,
+    "postgres": 0.982671,
+    "workers": 37.938525
+   }
+  },
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 10,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 36.587885,
+   "jobsPerSecond": 5.466290276139219,
+   "trainingSecondsTotal": 35.112625946014305,
+   "trainingSeconds": {
+    "p50": 0.16235312500066357,
+    "min": 0.10332966599526117,
+    "max": 0.3450451669996255
+   },
+   "workers": [
+    "32f378fbcbc4-1"
+   ],
+   "workerCount": 1,
+   "rep": 2,
+   "workerCpuLimits": [
+    1
+   ],
+   "workerTorchThreads": [
+    1
+   ],
+   "cpuSeconds": {
+    "api": 0.783475,
+    "postgres": 0.902942,
+    "workers": 37.493948
+   }
+  },
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 10,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 36.827621,
+   "jobsPerSecond": 5.43070647979135,
+   "trainingSecondsTotal": 35.29789051897387,
+   "trainingSeconds": {
+    "p50": 0.15998931249851012,
+    "min": 0.10291804100415902,
+    "max": 0.341493084000831
+   },
+   "workers": [
+    "32f378fbcbc4-1"
+   ],
+   "workerCount": 1,
+   "rep": 3,
+   "workerCpuLimits": [
+    1
+   ],
+   "workerTorchThreads": [
+    1
+   ],
+   "cpuSeconds": {
+    "api": 0.856066,
+    "postgres": 1.020185,
+    "workers": 38.076935
+   }
+  },
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 20,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 17.919775,
+   "jobsPerSecond": 11.160854419210061,
+   "trainingSecondsTotal": 34.207486393926956,
+   "trainingSeconds": {
+    "p50": 0.15922608349865186,
+    "min": 0.10440679200110026,
+    "max": 0.3327180420019431
+   },
+   "workers": [
+    "32f378fbcbc4-1",
+    "7de329d90cdc-1"
+   ],
+   "workerCount": 2,
+   "rep": 1,
+   "workerCpuLimits": [
+    1,
+    1
+   ],
+   "workerTorchThreads": [
+    1,
+    1
+   ],
+   "cpuSeconds": {
+    "api": 0.803725,
+    "postgres": 0.54579,
+    "workers": 38.196783
+   }
+  },
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 20,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 21.000081,
+   "jobsPerSecond": 9.523772789257336,
+   "trainingSecondsTotal": 40.24863822801126,
+   "trainingSeconds": {
+    "p50": 0.18334895850057364,
+    "min": 0.1123837920022197,
+    "max": 0.4454234579970944
+   },
+   "workers": [
+    "32f378fbcbc4-1",
+    "cf3544427cc9-1"
+   ],
+   "workerCount": 2,
+   "rep": 2,
+   "workerCpuLimits": [
+    1,
+    1
+   ],
+   "workerTorchThreads": [
+    1,
+    1
+   ],
+   "cpuSeconds": {
+    "api": 0.848396,
+    "postgres": 0.8286,
+    "workers": 44.94412
+   }
+  },
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 20,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 17.916264,
+   "jobsPerSecond": 11.1630415805438,
+   "trainingSecondsTotal": 34.43864342902816,
+   "trainingSeconds": {
+    "p50": 0.1596246249973774,
+    "min": 0.10548233399458695,
+    "max": 0.34114404200227
+   },
+   "workers": [
+    "32f378fbcbc4-1",
+    "709112a57444-1"
+   ],
+   "workerCount": 2,
+   "rep": 3,
+   "workerCpuLimits": [
+    1,
+    1
+   ],
+   "workerTorchThreads": [
+    1,
+    1
+   ],
+   "cpuSeconds": {
+    "api": 0.508319,
+    "postgres": 0.526201,
+    "workers": 38.339726
+   }
+  },
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 40,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 9.730622,
+   "jobsPerSecond": 20.553670669768078,
+   "trainingSecondsTotal": 37.03637509103282,
+   "trainingSeconds": {
+    "p50": 0.16349860449918197,
+    "min": 0.10533233400201425,
+    "max": 0.4721887499981676
+   },
+   "workers": [
+    "32f378fbcbc4-1",
+    "4006048ede05-1",
+    "7de329d90cdc-1",
+    "b19fcfc3bc39-1"
+   ],
+   "workerCount": 4,
+   "rep": 1,
+   "workerCpuLimits": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "workerTorchThreads": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "cpuSeconds": {
+    "api": 0.663448,
+    "postgres": 0.501039,
+    "workers": 45.556105
+   }
+  },
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 40,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 10.195718,
+   "jobsPerSecond": 19.616078043743464,
+   "trainingSecondsTotal": 38.92568288601615,
+   "trainingSeconds": {
+    "p50": 0.17872962500405265,
+    "min": 0.11055716700502671,
+    "max": 0.38817329199810047
+   },
+   "workers": [
+    "32f378fbcbc4-1",
+    "4b872dde68f7-1",
+    "664611b3a1a7-1",
+    "cf3544427cc9-1"
+   ],
+   "workerCount": 4,
+   "rep": 2,
+   "workerCpuLimits": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "workerTorchThreads": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "cpuSeconds": {
+    "api": 0.712796,
+    "postgres": 0.587411,
+    "workers": 49.702748
+   }
+  },
+  {
+   "warmupExperiment": 1,
+   "measuredExperiment": 2,
+   "warmupJobs": 40,
+   "jobs": 200,
+   "notSucceededOnce": [],
+   "windowSeconds": 9.449514,
+   "jobsPerSecond": 21.165109655374867,
+   "trainingSecondsTotal": 36.09692538395029,
+   "trainingSeconds": {
+    "p50": 0.16749533349866397,
+    "min": 0.10563254199951189,
+    "max": 0.39062233400181867
+   },
+   "workers": [
+    "32f378fbcbc4-1",
+    "529972f5e24a-1",
+    "709112a57444-1",
+    "fec6915171b3-1"
+   ],
+   "workerCount": 4,
+   "rep": 3,
+   "workerCpuLimits": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "workerTorchThreads": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "cpuSeconds": {
+    "api": 0.467703,
+    "postgres": 0.4556,
+    "workers": 44.186467
+   }
+  }
+ ]
+}

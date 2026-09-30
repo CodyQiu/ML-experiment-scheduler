@@ -1,6 +1,6 @@
 # Progress
 
-_Last updated: 2026-09-29_ (3.2 done; CI awaiting its first GitHub run)
+_Last updated: 2026-09-30_ (3.3 done; CI awaiting its first GitHub run)
 
 ## Status
 
@@ -13,7 +13,8 @@ _Last updated: 2026-09-29_ (3.2 done; CI awaiting its first GitHub run)
 | 2.4 | Scripted end-to-end demo with checks (`scripts/demo.sh`) | done |
 | 3.1 | CI (GitHub Actions): API tests, worker tests, and the checked demo on every push | built and replayed locally; not yet run on GitHub |
 | 3.2 | Structured logs: JSON lines with shared ids and event names from the API and workers | done |
-| 3.3–3.4 | Benchmarks, architecture README | next |
+| 3.3 | Benchmarks: dispatch, submission, and training throughput, with correctness checks (`scripts/benchmark.sh`) | done |
+| 3.4 | Architecture README | next |
 
 ## Completed
 
@@ -47,7 +48,7 @@ _Last updated: 2026-09-29_ (3.2 done; CI awaiting its first GitHub run)
 - **`CLAUDE.md`:** commands, architecture rules, testing conventions, and environment gotchas.
 
 Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3 as `eefcd0e`, 2.4 as
-`b62e554`, and 3.1 as `ba836a9`.
+`b62e554`, 3.1 as `ba836a9`, and 3.2 as `3033c08`.
 
 **2.2**
 
@@ -136,7 +137,63 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
 - **Docs:** the field and event catalog, and query recipes, are in DESIGN.md ("Logs") and the
   README. CLAUDE.md now treats logs as an interface.
 
+**3.3**
+
+- **`scripts/benchmark.sh`** takes about 10 minutes, in its own project (`mlsched-bench`,
+  `:19080`). It measures:
+  - dispatch without training, with 1 to 16 fake workers;
+  - submission of 1, 100, and 500 jobs;
+  - HTTP without the database;
+  - the disk's flush rate (`pg_test_fsync`);
+  - training with 1, 2, and 4 real workers.
+- **`scripts/bench/bench.py`** is the client: standard library only, inside the Compose network,
+  one process per fake worker.
+- **`scripts/bench/report.py`** writes each run's JSON and Markdown under `docs/benchmarks/`. It
+  regenerates the results and experiments sections of `docs/BENCHMARKS.md`, so no number there is
+  typed by hand.
+- **Correctness is checked while measuring:**
+  - every dispatch run must claim and complete each job exactly once;
+  - every training run must succeed on each job's first attempt, with every worker taking part;
+  - a run that fails a check exits `1`.
+- **The environment is recorded, not assumed:**
+  - the host, its power source, and the load of other containers;
+  - Docker, the commit, and whether `api/`, `worker/`, or `compose.yaml` had changed;
+  - PostgreSQL's durability settings;
+  - the CPU limits and torch threads that were in effect, and the API's database connections.
+- **Experiment knobs:** `BENCH_POOL_SIZE` and `BENCH_API_LOG_LEVEL`, which default to the stack's
+  own values.
+
 ## Verified (2026-09-29: macOS arm64, Docker Desktop 29.2.0)
+
+**3.3 (2026-09-30; the runs are in `docs/benchmarks/`):**
+
+- **Main run `20260930T161444Z`:** all parts, 3 rounds, 7.4 minutes. It passed every check:
+  - all 15 dispatch runs claimed and completed each of their 5,500 jobs exactly once;
+  - all 9 training runs succeeded on every job's first attempt, with every worker taking part.
+
+  Medians, all on battery power:
+
+  | Measurement | Result |
+  |---|---|
+  | Dispatch | 578 jobs/s with 1 fake worker and 2,967 with 16 (claim p50 0.77 and 2.56 ms) |
+  | Submitting 500 jobs | p50 31.7 ms |
+  | HTTP without the database | p50 0.16 ms |
+  | One flush | 95 µs |
+  | Training | 5.4, 11.2, and 20.6 jobs/s with 1, 2, and 4 workers, with 95–96% of worker time inside the training loop |
+- **Experiments:** four `api` runs: the defaults twice, a pool of 20, and log level WARN.
+  - Per-job logging costs about a third of dispatch throughput.
+  - The pool is not a limit up to 8 fake workers.
+  - 16 fake workers is too noisy to judge the pool. `docs/BENCHMARKS.md` has the tables and the
+    reasoning.
+- **The tooling itself:**
+  - A one-round smoke run exercised every part end to end before the real runs.
+  - In calibration, a single client process capped throughput at 16 fake workers. Running one
+    process per fake worker removed that; the client now uses about 1 core in total.
+  - A stub server with invalid response bodies, and a closed port, each made the client report
+    errors instead of hanging.
+  - `docker compose run` forwards stdin like `exec` does, and it swallowed the rest of a heredoc
+    during probing. The script gives it `</dev/null`.
+  - shellcheck reports no warnings for `scripts/benchmark.sh`.
 
 **3.2:**
 
@@ -342,6 +399,8 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
 - **Not everything in CI is pinned by content:**
   - images are pinned by version tag, not digest;
   - Maven and its dependencies are trusted over TLS (see DESIGN.md, Continuous integration).
+- **Per-job INFO logs cost about a third of dispatch throughput** at the benchmark's rates. Logging
+  after commit is the likely fix (see `docs/BENCHMARKS.md`).
 - **Logs stay in Docker.** Nothing ships, retains, or indexes them. `docker compose logs` plus
   `jq` is the query tool, and removing a container removes its logs.
 - **Other:** bodies parsed before size limits, no local JDK.
@@ -350,10 +409,8 @@ Committed on branch `milestone-2`: 1.2–2.1 as `84cf4a3`, 2.2 as `d0d7daf`, 2.3
 
 1. **The first CI run:** push `milestone-2`, then check the three jobs and the demo's summary in the
    Actions tab. Runner timings go here as observations, not benchmarks.
-2. **3.3 Benchmark:**
-   - `scripts/benchmark.sh` measures API latency (claim, complete, submit) separately from training
-     throughput at 1, 2, and 4 workers;
-   - it records the hardware, CPU limits, batch, and warm-up;
-   - a results template holds observed numbers only.
-3. **3.4 Architecture README:** the one-page architecture, how to run the demo, and what each
+2. **3.4 Architecture README:** the one-page architecture, how to run the demo, and what each
    guarantee rests on.
+3. **Optional: log events after commit.** The benchmark measured their cost. The change would take
+   the log write out of the transaction, and drop DESIGN.md's rolled-back-event caveat. Then re-run
+   `scripts/benchmark.sh api` and compare.

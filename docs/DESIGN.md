@@ -864,6 +864,9 @@ view it is.
   the other, which is how the demo's timeline labels attempts.
 - **Events are logged inside the transaction that makes the change.** If the commit then failed,
   the line would describe a change that was rolled back, and the error would follow it.
+  - At the benchmark's rates, the two per-job INFO events cost about a third of dispatch
+    throughput, mostly as waiting rather than CPU (`docs/BENCHMARKS.md`, Experiments).
+  - Logging after commit would address both points.
 - **Timestamps differ in precision.** The API prints up to 9 fractional digits and the worker 6,
   so pad the fractions before sorting the strings.
 - **Attempt ids appear in logs,** which only operators read, and never in read endpoints.
@@ -999,3 +1002,10 @@ demand, from the Actions tab once the workflow is on `main`.
 | Log fields come from SLF4J's fluent API (`addKeyValue`), not the MDC | The ids are known at the call site. The MDC would need scoping across threads (the heartbeat) and request lifecycles |
 | The worker's JSON formatter uses only the standard library | No new dependency in the locked environment |
 | The demo's "never reported" check has a positive control | A check that only asserts an absence passes silently once the format changes. The same query must find attempt 2's result |
+| Dispatch is benchmarked with fake workers that never train (`docs/BENCHMARKS.md`) | It separates the scheduler's own cost per job from training |
+| The benchmark's client runs inside the Compose network, one process per fake worker | Otherwise macOS port forwarding would be measured. In a trial run, one process's interpreter lock capped the client at 16 fake workers |
+| Every benchmark run checks that each job was claimed and completed exactly once | Numbers from a run that broke correctness would describe the wrong system. Under load, the check doubles as a concurrency test |
+| Benchmark CPU comes from cgroup counters read before and after | They are exact, and cost nothing while the measurement runs, unlike sampling `docker stats` |
+| Benchmark repetitions are interleaved by round | Drift during a long run, from heat or background load, affects every level alike |
+| Benchmark results are generated files, and the docs' results section is regenerated from them | No number in the docs is typed by hand, so none can drift from what was measured |
+| The benchmark's pool-size and log-level knobs default to the stack's own values | The default run measures the stack as it ships; an experiment changes one thing |

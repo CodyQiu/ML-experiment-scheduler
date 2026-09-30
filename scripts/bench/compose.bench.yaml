@@ -1,0 +1,24 @@
+# Overrides for scripts/benchmark.sh only. Not for normal use.
+services:
+  api:
+    environment:
+      # The stack's own defaults: HikariCP's pool of 10, and INFO, which logs every claim and
+      # result. scripts/benchmark.sh changes them only for the experiments in docs/BENCHMARKS.md.
+      SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE: ${BENCH_POOL_SIZE:-10}
+      LOGGING_LEVEL_DEV_CODYQIU_SCHEDULER: ${BENCH_API_LOG_LEVEL:-INFO}
+
+  worker:
+    environment:
+      # An idle worker polls at most every 0.5 s, so every worker starts on a new batch within
+      # 0.5 s of it being queued. A worker never sleeps while work is queued, so this does not
+      # change throughput, only how quickly a measured batch gets going.
+      POLL_MAX_SECONDS: "0.5"
+
+  # The benchmark's client (scripts/bench/bench.py), on the stack's network, so that macOS port
+  # forwarding is not part of any measurement. The profile keeps "up" from starting it.
+  bench:
+    image: python:3.14.7-slim-trixie
+    profiles: [bench]
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["python", "/scripts/bench/bench.py"]
